@@ -1,46 +1,32 @@
 #!/usr/bin/env python3
 # app.py
-# Premium Movie Search & Streaming App for Android Termux
-# Auto-installs native and Python dependencies
-# Home page with trending films + category tabs + search results + browser player + download
+# Final stable movie search + streaming + download app for Termux
+# Uses built-in Python HTTP server instead of FastAPI
+# Features:
+# - Trending home page
+# - Search by movie name
+# - Language and year filter
+# - Tab categories: Trending / Hindi / English / South Indian / Regional
+# - Thumbnail/poster support
+# - Browser play
+# - Direct download
+# - Auto package installation
+# - Real YouTube/public search fallback
 
 import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
 # ------------------------------------------------------------
-# Bootstrapping dependencies before importing third-party libs
+# Dependency bootstrap
 # ------------------------------------------------------------
-
-REQUIRED_PYTHON = [
-    "fastapi",
-    "uvicorn",
-    "yt-dlp",
-    "beautifulsoup4",
-    "requests",
-    "lxml",
-    "jinja2",
-]
-
-MODULE_MAP = {
-    "fastapi": "fastapi",
-    "uvicorn": "uvicorn",
-    "yt-dlp": "yt_dlp",
-    "beautifulsoup4": "bs4",
-    "requests": "requests",
-    "lxml": "lxml",
-    "jinja2": "jinja2",
-}
-
-TERMUX = os.path.exists("/data/data/com.termux/files/usr/bin/pkg")
-DEBIAN = shutil.which("apt-get") is not None
 
 def run_command(command: List[str], timeout: int = 600) -> subprocess.CompletedProcess:
     try:
@@ -48,102 +34,43 @@ def run_command(command: List[str], timeout: int = 600) -> subprocess.CompletedP
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"Command timed out: {' '.join(command)}") from exc
 
-def install_termux_packages(packages: List[str]) -> None:
-    if not TERMUX:
-        return
-    for pkg_name in packages:
+def pip_install(pkg: str) -> bool:
+    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", pkg]
+    result = run_command(cmd, timeout=600)
+    if result.returncode == 0:
+        return True
+
+    fallback = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", "--break-system-packages", pkg]
+    result2 = run_command(fallback, timeout=600)
+    return result2.returncode == 0
+
+def ensure_python_packages() -> None:
+    required = ["requests", "beautifulsoup4", "yt-dlp", "lxml"]
+    for pkg in required:
         try:
-            installed = run_command(["pkg", "list-installed"], timeout=60)
-            if pkg_name in (installed.stdout or ""):
-                continue
-            result = run_command(["pkg", "install", "-y", pkg_name], timeout=600)
-            if result.returncode != 0:
-                print(f"[WARN] pkg install failed for '{pkg_name}': {result.stderr.strip() or result.stdout.strip()}")
-        except Exception as exc:
-            print(f"[WARN] Exception installing '{pkg_name}': {exc}")
-
-def install_debian_packages(packages: List[str]) -> None:
-    if not DEBIAN:
-        return
-    try:
-        run_command(["apt-get", "update"], timeout=600)
-    except Exception:
-        pass
-
-    for pkg_name in packages:
-        try:
-            result = run_command(["apt-get", "install", "-y", pkg_name], timeout=600)
-            if result.returncode != 0:
-                print(f"[WARN] apt-get failed for '{pkg_name}': {result.stderr.strip() or result.stdout.strip()}")
-        except Exception as exc:
-            print(f"[WARN] Exception apt-get installing '{pkg_name}': {exc}")
-
-def ensure_native_dependencies() -> None:
-    if TERMUX:
-        install_termux_packages([
-            "ffmpeg",
-            "libxml2",
-            "libxslt",
-            "libxml2-dev",
-            "libxslt-dev",
-            "clang",
-            "make",
-            "pkg-config",
-        ])
-    elif DEBIAN:
-        install_debian_packages([
-            "ffmpeg",
-            "libxml2-dev",
-            "libxslt1.1",
-            "libxslt-dev",
-            "build-essential",
-            "pkg-config",
-        ])
-
-def ensure_python_dependencies() -> None:
-    for package in REQUIRED_PYTHON:
-        module_name = MODULE_MAP.get(package, package)
-        try:
-            __import__(module_name)
+            if pkg == "yt-dlp":
+                import yt_dlp  # type: ignore
+            elif pkg == "beautifulsoup4":
+                import bs4  # type: ignore
+            elif pkg == "lxml":
+                import lxml  # type: ignore
+            else:
+                __import__(pkg)
             continue
         except Exception:
-            pass
+            print(f"[INFO] Installing missing package: {pkg}")
+            pip_install(pkg)
 
-        if package == "lxml":
-            ensure_native_dependencies()
-
-        cmd = [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "--disable-pip-version-check",
-            "--no-cache-dir",
-            package,
-        ]
-        result = run_command(cmd, timeout=600)
-        if result.returncode != 0:
-            err = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(f"Failed to install '{package}': {err}")
-
-ensure_native_dependencies()
-ensure_python_dependencies()
-
-# ------------------------------------------------------------
-# Import loaded third-party libs
-# ------------------------------------------------------------
+ensure_python_packages()
 
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from jinja2 import Template
-import uvicorn
 import yt_dlp
 
 APP_TITLE = "Movie Search Pro"
 APP_VERSION = "1.0.0"
+HOST = "0.0.0.0"
+PORT = 8000
 
 # ------------------------------------------------------------
 # Helpers
@@ -161,8 +88,8 @@ def safe_int(value: Any, default: int = 0) -> int:
     except Exception:
         return default
 
-def canonical_query(raw_query: str) -> str:
-    q = safe_text(raw_query, "")
+def canonical_query(raw: str) -> str:
+    q = safe_text(raw, "")
     q = q.replace("\n", " ").replace("\r", " ")
     q = re.sub(r"\s+", " ", q)
     return q.strip()
@@ -194,26 +121,86 @@ def format_duration(seconds: Optional[int]) -> str:
     hours, rem = divmod(minutes, 60)
     return f"{hours}h {rem}m"
 
-def display_label(height: Optional[int], tbr: Optional[int]) -> str:
+def label_from_height(height: Optional[int], tbr: Optional[int]) -> str:
     target = height or tbr
     if target is None:
         return "HD"
     return f"{target}p"
 
 # ------------------------------------------------------------
-# YouTube page parsing
+# TMDB poster fallback
+# ------------------------------------------------------------
+
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip()
+TMDB_BASE = "https://api.themoviedb.org/3"
+
+POSTER_FALLBACKS = {
+    "spider-man": "https://image.tmdb.org/t/p/w500/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg",
+    "spider man": "https://image.tmdb.org/t/p/w500/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg",
+    "dune": "https://image.tmdb.org/t/p/w500/8b8R8l88Qje9dn9OE8PY05Nxl1X.jpg",
+    "avatar": "https://image.tmdb.org/t/p/w500/kyeqWdyMXu8q5f6FvF5l7WHA0zM.jpg",
+    "pushpa": "https://image.tmdb.org/t/p/w500/7B5D9RrJfhB6A9x2pV6u5h9B2Wy.jpg",
+    "leo": "https://image.tmdb.org/t/p/w500/1v3D9n8v6GZKvcN2m9XJv8M3hJt.jpg",
+    "salaar": "https://image.tmdb.org/t/p/w500/5PzYU2LSQ9k4jQ0pG5kGbrbqjDI.jpg",
+    "pathaan": "https://image.tmdb.org/t/p/w500/t4XdI3y8W8L4oul0YwVf9eV9dF4.jpg",
+    "the batman": "https://image.tmdb.org/t/p/w500/8RW2runSEc34r5Jq4v3oK1s58M9.jpg",
+    "oppenheimer": "https://image.tmdb.org/t/p/w500/8Gxv8gSFCU0XGD1nNfAbIwxDFJY.jpg",
+    "interstellar": "https://image.tmdb.org/t/p/w500/gEU2QniE6E77NI6lCU6MxlNBvIx.jpg",
+    "deadpool": "https://image.tmdb.org/t/p/w500/5I8RQGvT7c6H8Hw4e5sW8gQ4j9y.jpg",
+    "mad max": "https://image.tmdb.org/t/p/w500/6MIfYls3lK3v6vGx2XrD3WJkN6Q.jpg",
+    "war": "https://image.tmdb.org/t/p/w500/4K7ZbX3yHjKZgJ4pT7VX5bvFNrh.jpg",
+    "avengers": "https://image.tmdb.org/t/p/w500/RYMX2wcKCBAr24UyPD7xwmjaTn.jpg",
+    "animal": "https://image.tmdb.org/t/p/w500/9Q3Vs3QqfQ2f8rQ0x2PZ8H5W7cX.jpg",
+}
+
+def movie_poster_url(query: str, year: Optional[int] = None) -> str:
+    q = canonical_query(query).lower()
+
+    # exact fallback map first
+    for key, url in POSTER_FALLBACKS.items():
+        if key in q:
+            return url
+
+    # TMDb API if key exists
+    if TMDB_API_KEY:
+        try:
+            url = f"{TMDB_BASE}/search/movie"
+            params = {
+                "api_key": TMDB_API_KEY,
+                "query": q,
+                "include_adult": "false",
+                "page": "1",
+            }
+            if year:
+                params["year"] = str(year)
+            resp = requests.get(url, params=params, timeout=20)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("results", [])
+                if results:
+                    poster_path = safe_text(results[0].get("poster_path"), "")
+                    if poster_path:
+                        return f"https://image.tmdb.org/t/p/w500{poster_path}"
+        except Exception:
+            pass
+
+    # fallback generic poster
+    return "https://images.unsplash.com/photo-1492691527719-9d1e07e534b4?auto=format&fit=crop&w=1200&q=80"
+
+# ------------------------------------------------------------
+# YouTube parsing
 # ------------------------------------------------------------
 
 def extract_runs_text(runs: List[Dict[str, Any]]) -> str:
     if not isinstance(runs, list):
         return ""
-    texts = []
+    parts = []
     for item in runs:
         if isinstance(item, dict):
             txt = safe_text(item.get("text"), "")
             if txt:
-                texts.append(txt)
-    return " ".join(texts).strip()
+                parts.append(txt)
+    return " ".join(parts).strip()
 
 def youtube_video_data_from_html(html_text: str, max_results: int = 12) -> List[Dict[str, Any]]:
     match = re.search(r'ytInitialData\s*=\s*({.*?})\s*;\s*(?:var\s+\w+|</script>)', html_text, re.S)
@@ -347,17 +334,20 @@ def extract_best_stream(webpage_url: str) -> Dict[str, Any]:
     best = filtered_sorted[0]
     stream_url = best.get("url") or webpage_url
     height = safe_int(best.get("height"), 0)
-    label = display_label(height, safe_int(best.get("tbr"), 0))
+    label = label_from_height(height, safe_int(best.get("tbr"), 0))
     return {"url": stream_url, "label": label, "height": height}
 
 # ------------------------------------------------------------
-# Search functions
+# Search APIs
 # ------------------------------------------------------------
 
-def search_youtube(query: str, limit: int = 8) -> List[Dict[str, Any]]:
+def search_youtube(query: str, limit: int = 8, year: Optional[int] = None) -> List[Dict[str, Any]]:
     q = canonical_query(query)
     if not q:
         return []
+
+    if year:
+        q = f"{q} {year}"
 
     search_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(q)}"
     headers = {
@@ -408,7 +398,6 @@ def search_youtube(query: str, limit: int = 8) -> List[Dict[str, Any]]:
 
     results = []
     seen = set()
-
     for item in parsed:
         watch_url = safe_text(item.get("url"), "")
         if not watch_url:
@@ -422,6 +411,9 @@ def search_youtube(query: str, limit: int = 8) -> List[Dict[str, Any]]:
             continue
         seen.add(key)
 
+        if not thumb:
+            thumb = movie_poster_url(title, year)
+
         results.append({
             "title": title,
             "url": watch_url,
@@ -431,13 +423,18 @@ def search_youtube(query: str, limit: int = 8) -> List[Dict[str, Any]]:
             "resolution": stream_info.get("label") or "HD",
             "duration": safe_text(item.get("duration"), "N/A"),
             "provider": safe_text(item.get("provider"), "YouTube"),
-            "language": q,
+            "language": query,
+            "year": year,
         })
 
     return results[:limit]
 
-def search_generic_web(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    url = f"https://www.bing.com/search?q={urllib.parse.quote(query + ' movie download')}"
+def search_generic_web(query: str, limit: int = 5, year: Optional[int] = None) -> List[Dict[str, Any]]:
+    q = canonical_query(query)
+    if year:
+        q = f"{q} {year}"
+
+    url = f"https://www.bing.com/search?q={urllib.parse.quote(q + ' movie download')}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
@@ -461,7 +458,6 @@ def search_generic_web(query: str, limit: int = 5) -> List[Dict[str, Any]]:
         low = href.lower()
         if "youtube.com" not in low and ".mp4" not in low and ".m3u8" not in low and ".mpd" not in low and ".webm" not in low:
             continue
-
         if href in seen:
             continue
         seen.add(href)
@@ -473,11 +469,12 @@ def search_generic_web(query: str, limit: int = 5) -> List[Dict[str, Any]]:
             "url": href,
             "stream_url": stream_info.get("url") or href,
             "download_url": stream_info.get("url") or href,
-            "thumbnail": "",
+            "thumbnail": movie_poster_url(title, year),
             "resolution": stream_info.get("label") or "HD",
             "duration": "N/A",
             "provider": "Public Web",
-            "language": query,
+            "language": q,
+            "year": year,
         })
         if len(out) >= limit:
             break
@@ -490,7 +487,7 @@ def build_language_variants(query: str, language: str) -> List[str]:
         return []
 
     base = q
-    lang_map = {
+    variants_map = {
         "all": [
             base,
             f"{base} movie",
@@ -531,17 +528,17 @@ def build_language_variants(query: str, language: str) -> List[str]:
         ],
     }
 
-    variants = lang_map.get(language.lower(), lang_map["all"])
+    arr = variants_map.get(language.lower(), variants_map["all"])
     unique = []
     seen = set()
-    for item in variants:
+    for item in arr:
         norm = canonical_query(item)
         if norm and norm not in seen:
             seen.add(norm)
             unique.append(norm)
     return unique[:8]
 
-def search_public_media(query: str, language: str = "all", max_results: int = 12) -> List[Dict[str, Any]]:
+def search_public_media(query: str, language: str = "all", year: Optional[int] = None, max_results: int = 12) -> List[Dict[str, Any]]:
     q = canonical_query(query)
     if not q:
         return []
@@ -550,7 +547,7 @@ def search_public_media(query: str, language: str = "all", max_results: int = 12
     seen = set()
 
     for variant in build_language_variants(q, language):
-        for item in search_youtube(variant, limit=5):
+        for item in search_youtube(variant, limit=5, year=year):
             key = (item.get("title"), item.get("stream_url"))
             if key in seen:
                 continue
@@ -559,7 +556,7 @@ def search_public_media(query: str, language: str = "all", max_results: int = 12
             if len(results) >= max_results:
                 return results
 
-        for item in search_generic_web(variant, limit=3):
+        for item in search_generic_web(variant, limit=3, year=year):
             key = (item.get("title"), item.get("stream_url"))
             if key in seen:
                 continue
@@ -567,11 +564,27 @@ def search_public_media(query: str, language: str = "all", max_results: int = 12
             results.append(item)
             if len(results) >= max_results:
                 return results
+
+    # Best effort: use explicit query + year + poster
+    if not results:
+        base_result = {
+            "title": q,
+            "url": "",
+            "stream_url": "",
+            "download_url": "",
+            "thumbnail": movie_poster_url(q, year),
+            "resolution": "HD",
+            "duration": "N/A",
+            "provider": "Search",
+            "language": language,
+            "year": year,
+        }
+        results.append(base_result)
 
     return results[:max_results]
 
 # ------------------------------------------------------------
-# Trending queries for home tabs
+# Trending categories
 # ------------------------------------------------------------
 
 TRENDING_MAP = {
@@ -619,13 +632,13 @@ TRENDING_MAP = {
     ],
 }
 
-def get_trending_movies(category: str = "trending", limit: int = 12) -> List[Dict[str, Any]]:
+def get_trending_movies(category: str = "trending", limit: int = 12, year: Optional[int] = None) -> List[Dict[str, Any]]:
     queries = TRENDING_MAP.get(category.lower(), TRENDING_MAP["trending"])
-    results: List[Dict[str, Any]] = []
+    results = []
     seen = set()
 
     for query in queries:
-        for item in search_public_media(query, language="all", max_results=4):
+        for item in search_public_media(query, language="all", year=year, max_results=4):
             key = (item.get("title"), item.get("stream_url"))
             if key in seen:
                 continue
@@ -637,28 +650,24 @@ def get_trending_movies(category: str = "trending", limit: int = 12) -> List[Dic
     return results[:limit]
 
 # ------------------------------------------------------------
-# FastAPI app
+# HTML content
 # ------------------------------------------------------------
 
-app = FastAPI(title=APP_TITLE, version=APP_VERSION)
-
-HTML_TEMPLATE = Template("""
+HTML_TEMPLATE = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>{{ title }}</title>
+  <title>Movie Search Pro</title>
   <style>
     :root {
       --bg: #0b1020;
       --panel: #101827;
-      --panel-2: #111b2d;
-      --panel-3: #152238;
-      --text: #e5edf9;
+      --text: #edf3ff;
       --muted: #9bb0cc;
       --primary: #4ea0ff;
-      --primary-2: #66d9ef;
+      --primary2: #66d9ef;
       --success: #2ae0a4;
       --danger: #ff627d;
       --border: rgba(148,163,184,0.12);
@@ -668,7 +677,7 @@ HTML_TEMPLATE = Template("""
       margin: 0; padding: 0;
       background: radial-gradient(circle at top, #122033 0%, var(--bg) 45%, #080d18 100%);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       min-height: 100%;
     }
     body {
@@ -693,35 +702,32 @@ HTML_TEMPLATE = Template("""
     }
     .brand-mark {
       width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px;
-      background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #00111f; font-weight: 800;
+      background: linear-gradient(135deg, var(--primary), var(--primary2)); color: #00111f; font-weight: 800;
       box-shadow: 0 8px 20px rgba(78,160,255,0.25);
     }
     .search-box {
-      display: flex; flex-wrap: wrap; gap: 10px; width: min(700px, 100%); margin-left: auto;
+      display: flex; flex-wrap: wrap; gap: 10px; width: min(760px, 100%); margin-left: auto;
     }
     .search-field {
-      flex: 1 1 260px; background: rgba(18,28,44,0.95); border: 1px solid var(--border); border-radius: 14px; padding: 12px 14px;
+      flex: 1 1 220px; background: rgba(18,28,44,0.95); border: 1px solid var(--border); border-radius: 14px; padding: 12px 14px;
       color: var(--text); font-size: 1rem; outline: none; min-width: 0;
     }
     .search-field::placeholder { color: var(--muted); }
-    select.search-field { max-width: 180px; flex: 0 0 180px; }
-
+    select.search-field { max-width: 170px; flex: 0 0 170px; }
     .search-button {
-      border: none; border-radius: 14px; background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #081521; font-weight: 800;
+      border: none; border-radius: 14px; background: linear-gradient(135deg, var(--primary), var(--primary2)); color: #081521; font-weight: 800;
       padding: 12px 16px; cursor: pointer; min-width: 110px;
     }
-
     .tabs {
-      display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 16px; padding: 0;
+      display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 16px;
     }
     .tab-btn {
       background: rgba(17,24,39,0.88); border: 1px solid var(--border); color: var(--text);
       border-radius: 12px; padding: 10px 12px; font-weight: 700; cursor: pointer;
     }
     .tab-btn.active {
-      background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #071521; border: none;
+      background: linear-gradient(135deg, var(--primary), var(--primary2)); color: #071521; border: none;
     }
-
     .hero {
       background: linear-gradient(135deg, rgba(30,41,59,0.7), rgba(17,32,49,0.8));
       border: 1px solid var(--border); border-radius: 22px; padding: 20px; margin-bottom: 18px;
@@ -746,20 +752,17 @@ HTML_TEMPLATE = Template("""
     }
     .results-head h2 { margin: 0; font-size: 1.15rem; letter-spacing: 0.03em; }
     .hint { color: var(--muted); font-size: 0.92rem; }
-
     .grid {
       display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px;
     }
     .card {
       background: linear-gradient(180deg, rgba(17,24,39,0.96), rgba(13,19,31,0.96));
-      border: 1px solid var(--border);
-      border-radius: 18px; overflow: hidden;
-      box-shadow: 0 12px 28px rgba(3,7,18,0.32);
+      border: 1px solid var(--border); border-radius: 18px; overflow: hidden; box-shadow: 0 12px 28px rgba(3,7,18,0.32);
       transition: transform 0.18s ease, border-color 0.18s ease;
     }
     .card:hover { transform: translateY(-2px); border-color: rgba(78,160,255,0.5); }
     .thumb-wrap {
-      position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; background: #0f172a;
+      position: relative; width: 100%; aspect-ratio: 16/9; overflow: hidden; background: #0f172a;
     }
     .thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
     .badge-time {
@@ -781,7 +784,7 @@ HTML_TEMPLATE = Template("""
       appearance: none; border: 1px solid var(--border); border-radius: 10px; background: rgba(17,24,39,0.92); color: var(--text);
       padding: 9px 11px; font-weight: 700; cursor: pointer; flex: 1 1 110px; text-align: center; text-decoration: none; font-size: 0.9rem;
     }
-    .button.primary { background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #071521; border: none; }
+    .button.primary { background: linear-gradient(135deg, var(--primary), var(--primary2)); color: #071521; border: none; }
     .button.danger { background: rgba(255,98,125,0.08); color: #ffc2ce; border-color: rgba(255,98,125,0.2); }
     .empty {
       text-align: center; color: var(--muted); background: rgba(17,24,39,0.7); border: 1px dashed rgba(148,163,184,0.35); border-radius: 18px; padding: 28px 18px; margin-top: 16px;
@@ -822,8 +825,9 @@ HTML_TEMPLATE = Template("""
       <div class="toolbar-inner">
         <div class="brand">
           <div class="brand-mark">M</div>
-          <span>{{ title }}</span>
+          <span>Movie Search Pro</span>
         </div>
+
         <form id="searchForm" class="search-box">
           <input id="query" class="search-field" type="text" placeholder="Search movies..." value="Spider-Man" />
           <select id="language" class="search-field">
@@ -832,6 +836,14 @@ HTML_TEMPLATE = Template("""
             <option value="english">English</option>
             <option value="south indian">South Indian</option>
             <option value="regional">Regional</option>
+          </select>
+          <select id="year" class="search-field">
+            <option value="all">All years</option>
+            <option value="2025">2025</option>
+            <option value="2024">2024</option>
+            <option value="2023">2023</option>
+            <option value="2022">2022</option>
+            <option value="2021">2021</option>
           </select>
           <button class="search-button" type="submit">Search</button>
         </form>
@@ -848,10 +860,10 @@ HTML_TEMPLATE = Template("""
 
     <section class="hero">
       <h1>Latest Movies, Trending Now</h1>
-      <p>Spider-Man, new theater releases, Bollywood, Hollywood, South Indian, and regional movie results with thumbnails, streaming, and download options.</p>
+      <p>Spider-Man, new theater releases, Bollywood, Hollywood, South Indian, and regional movie results with poster thumbnails, streaming, and download options.</p>
       <div class="status-row">
-        <div class="badge"><span class="dot"></span> Auto-ready for Termux</div>
-        <div class="badge">FastAPI + yt-dlp + HTML5 Player</div>
+        <div class="badge"><span class="dot"></span> Stable Termux build</div>
+        <div class="badge">Python stdlib + requests + yt-dlp + HTML5 Player</div>
       </div>
     </section>
 
@@ -882,14 +894,10 @@ HTML_TEMPLATE = Template("""
     const searchForm = document.getElementById('searchForm');
     const queryInput = document.getElementById('query');
     const languageSelect = document.getElementById('language');
+    const yearSelect = document.getElementById('year');
 
     function escapeHtml(value = '') {
-      return String(value)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
+      return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
     }
 
     function renderCard(item) {
@@ -899,6 +907,7 @@ HTML_TEMPLATE = Template("""
       const thumbnailUrl = item.thumbnail || 'https://images.unsplash.com/photo-1492691527719-9d1e07e534b4?auto=format&fit=crop&w=1200&q=80';
       const streamUrl = item.stream_url || item.url || '';
       const downloadUrl = item.download_url || item.stream_url || item.url || '';
+      const year = item.year || 'N/A';
 
       card.innerHTML = `
         <div class="thumb-wrap">
@@ -910,6 +919,9 @@ HTML_TEMPLATE = Template("""
           <div class="meta">
             <span class="pill">${escapeHtml(item.provider || 'Public')}</span>
             <span>${escapeHtml(item.resolution || 'HD')}</span>
+          </div>
+          <div class="meta" style="margin-top: 0;">
+            <span>Year: ${escapeHtml(String(year))}</span>
           </div>
           <div class="actions">
             <button class="button primary" type="button" data-action="play" data-url="${escapeHtml(streamUrl)}" data-title="${escapeHtml(item.title || 'Movie')}">Play</button>
@@ -948,12 +960,12 @@ HTML_TEMPLATE = Template("""
       videoPlayer.load();
     }
 
-    async function fetchResults(query, language) {
+    async function fetchResults(query, language, year) {
       statusEl.textContent = 'Searching...';
       resultsEl.innerHTML = '';
 
       try {
-        const response = await fetch(`/api/search?q=${encodeURIComponent(query)}&language=${encodeURIComponent(language)}&limit=12`);
+        const response = await fetch(`/api/search?q=${encodeURIComponent(query)}&language=${encodeURIComponent(language)}&year=${encodeURIComponent(year)}&limit=12`);
         const payload = await response.json();
         const items = payload.results || [];
 
@@ -977,7 +989,8 @@ HTML_TEMPLATE = Template("""
       resultsEl.innerHTML = '';
 
       try {
-        const response = await fetch(`/api/trending?category=${encodeURIComponent(category)}`);
+        const year = yearSelect.value === 'all' ? 'all' : yearSelect.value;
+        const response = await fetch(`/api/trending?category=${encodeURIComponent(category)}&year=${encodeURIComponent(year)}`);
         const payload = await response.json();
         const items = payload.results || [];
 
@@ -1005,18 +1018,23 @@ HTML_TEMPLATE = Template("""
         if (category === 'trending') {
           queryInput.value = 'Spider-Man';
           languageSelect.value = 'all';
+          yearSelect.value = 'all';
         } else if (category === 'hindi') {
           queryInput.value = 'latest Hindi movie';
           languageSelect.value = 'hindi';
+          yearSelect.value = '2025';
         } else if (category === 'english') {
           queryInput.value = 'latest English movie';
           languageSelect.value = 'english';
+          yearSelect.value = '2025';
         } else if (category === 'south indian') {
           queryInput.value = 'latest South Indian movie';
           languageSelect.value = 'south indian';
+          yearSelect.value = '2025';
         } else {
           queryInput.value = 'latest regional movie';
           languageSelect.value = 'regional';
+          yearSelect.value = '2025';
         }
 
         loadTrending(category);
@@ -1027,11 +1045,12 @@ HTML_TEMPLATE = Template("""
       event.preventDefault();
       const query = queryInput.value.trim();
       const language = languageSelect.value;
+      const year = yearSelect.value === 'all' ? 'all' : yearSelect.value;
       if (!query) {
         queryInput.focus();
         return;
       }
-      fetchResults(query, language);
+      fetchResults(query, language, year);
     });
 
     document.getElementById('closeModal').addEventListener('click', closeModal);
@@ -1047,111 +1066,189 @@ HTML_TEMPLATE = Template("""
   </script>
 </body>
 </html>
-""")
+"""
 
-@app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
-    return HTMLResponse(content=HTML_TEMPLATE.render(title=APP_TITLE))
+# ------------------------------------------------------------
+# HTTP server
+# ------------------------------------------------------------
 
-@app.get("/health")
-async def health() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "title": APP_TITLE,
-        "ffmpeg": bool(shutil.which("ffmpeg")),
-        "python": sys.version.split()[0],
-    }
+def json_response(obj: Dict[str, Any], status: int = 200) -> bytes:
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
-@app.get("/api/trending")
-async def api_trending(category: str = Query("trending")) -> JSONResponse:
-    category_key = canonical_query(category).lower() or "trending"
-    results = get_trending_movies(category_key, limit=12)
-    return JSONResponse({
-        "category": category_key,
-        "count": len(results),
-        "results": results,
-    })
+class MovieHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
 
-@app.get("/api/search")
-async def api_search(
-    q: str = Query(..., min_length=1),
-    language: str = Query("all"),
-    limit: int = Query(12, ge=1, le=25),
-) -> JSONResponse:
-    query = canonical_query(q)
-    if not query:
-        raise HTTPException(status_code=400, detail="Query cannot be empty")
+        if path in ("/", ""):
+            payload = HTML_TEMPLATE.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
-    results = search_public_media(query, language=language, max_results=limit)
-    return JSONResponse({
-        "query": query,
-        "language": language,
-        "count": len(results),
-        "results": results,
-    })
+        if path == "/health":
+            payload = json_response({
+                "status": "ok",
+                "title": APP_TITLE,
+                "version": APP_VERSION,
+                "python": sys.version.split()[0],
+            })
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
-@app.get("/download")
-async def download_media(url: str = Query(...)) -> StreamingResponse:
-    if not url:
-        raise HTTPException(status_code=400, detail="Missing url")
+        if path == "/api/trending":
+            category = safe_text(query.get("category", ["trending"])[0], "trending")
+            year_raw = safe_text(query.get("year", ["all"])[0], "all")
+            year = None if year_raw.lower() == "all" else safe_int(year_raw, 0) or None
+            results = get_trending_movies(category=category, limit=12, year=year)
+            payload = json_response({
+                "category": category,
+                "count": len(results),
+                "results": results,
+            })
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
-    decoded = urllib.parse.unquote(url)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
-        "Referer": "https://www.youtube.com/",
-    }
+        if path == "/api/search":
+            q = safe_text(query.get("q", [""])[0], "")
+            language = safe_text(query.get("language", ["all"])[0], "all")
+            year_raw = safe_text(query.get("year", ["all"])[0], "all")
+            year = None if year_raw.lower() == "all" else safe_int(year_raw, 0) or None
+            limit = safe_int(query.get("limit", ["12"])[0], 12)
 
-    # Cache downloaded file locally
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", decoded.split("/")[-1] or "movie")[:80]
-    if not safe_name.lower().endswith((".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".ts", ".mov", ".avi")):
-        safe_name = "movie_download.mp4"
+            if not q:
+                payload = json_response({"error": "Missing query q"}, 400)
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
 
-    cache_id = hashlib.md5(decoded.encode("utf-8")).hexdigest()
-    file_path = os.path.join(tempfile.gettempdir(), f"movie_stream_{cache_id}_{safe_name}")
+            results = search_public_media(q, language=language, year=year, max_results=limit)
+            payload = json_response({
+                "query": q,
+                "language": language,
+                "year": year,
+                "count": len(results),
+                "results": results,
+            })
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
-    try:
-        if "youtube.com" in decoded.lower() or "youtu.be" in decoded.lower():
-            opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
-                "format": "best[ext=mp4]/best",
-                "outtmpl": file_path,
-                "restrictfilenames": False,
-                "nocheckcertificate": True,
-                "geo_bypass": True,
-                "merge_output_format": "mp4",
-            }
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([decoded])
-        else:
-            response = requests.get(decoded, stream=True, timeout=60, headers=headers, allow_redirects=True)
-            response.raise_for_status()
-            with open(file_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to prepare download: {exc}")
+        if path == "/download":
+            url = safe_text(query.get("url", [""])[0], "")
+            if not url:
+                payload = json_response({"error": "Missing url"}, 400)
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
 
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=502, detail="Download file not generated")
+            decoded = urllib.parse.unquote(url)
+            target_name = re.sub(r"[^A-Za-z0-9._-]+", "_", decoded.split("/")[-1] or "movie")[:80]
+            if not target_name.lower().endswith((".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".ts", ".mov", ".avi")):
+                target_name = "movie_download.mp4"
 
-    with open(file_path, "rb") as f:
-        payload = f.read()
+            cache_id = hashlib.md5(decoded.encode("utf-8")).hexdigest()
+            file_path = os.path.join(tempfile.gettempdir(), f"movie_stream_{cache_id}_{target_name}")
 
-    return StreamingResponse(
-        iter([payload]),
-        media_type="video/mp4",
-        headers={
-            "Content-Disposition": f'attachment; filename="{os.path.basename(file_path)}"',
-            "Cache-Control": "no-store",
-        },
-    )
+            try:
+                if "youtube.com" in decoded.lower() or "youtu.be" in decoded.lower():
+                    ydl_opts = {
+                        "quiet": True,
+                        "no_warnings": True,
+                        "noplaylist": True,
+                        "format": "best[ext=mp4]/best",
+                        "outtmpl": file_path,
+                        "restrictfilenames": False,
+                        "nocheckcertificate": True,
+                        "geo_bypass": True,
+                        "merge_output_format": "mp4",
+                    }
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([decoded])
+                else:
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+                        "Referer": "https://www.youtube.com/",
+                    }
+                    response = requests.get(decoded, stream=True, timeout=60, headers=headers, allow_redirects=True)
+                    response.raise_for_status()
+                    with open(file_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=65536):
+                            if chunk:
+                                f.write(chunk)
+            except Exception as exc:
+                payload = json_response({"error": f"Download failed: {exc}"}, 502)
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
+            try:
+                with open(file_path, "rb") as f:
+                    payload = f.read()
+            except Exception:
+                payload = b""
+
+            if not payload:
+                payload = json_response({"error": "No file generated"}, 502)
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(file_path)}"')
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        payload = b'{"error":"not found"}'
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
 
 def main() -> None:
-    print(f"[{APP_TITLE}] Starting server on http://0.0.0.0:8000")
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False, log_level="info")
+    print(f"[{APP_TITLE}] Starting server on http://{HOST}:{PORT}")
+    server = ThreadingHTTPServer((HOST, PORT), MovieHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[INFO] Stopping server")
+    finally:
+        server.server_close()
 
 if __name__ == "__main__":
     main()
