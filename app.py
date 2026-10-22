@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # app.py
-# Production-ready single-file Android Termux app:
-# media search, HTML5 streaming UI, direct downloads, auto bootstrapping
+# Android Termux auto-installer + movie search + streaming UI + download proxy
+# No manual dependency installation required
+# Works with public search results and browser HTML5 playback
 
 import json
 import os
@@ -9,12 +10,11 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 import urllib.parse
 from typing import Any, Dict, List, Optional
 
 # -------------------------------------------------------------------
-# Auto-bootstrap dependencies before any third-party import
+# Auto-bootstrap dependencies before importing third-party libs
 # -------------------------------------------------------------------
 
 REQUIRED_PYTHON = [
@@ -25,12 +25,6 @@ REQUIRED_PYTHON = [
     "requests",
     "lxml",
     "jinja2",
-]
-
-REQUIRED_SYSTEM = [
-    "ffmpeg",
-    "libxml2",
-    "libxslt",
 ]
 
 MODULE_MAP = {
@@ -57,13 +51,12 @@ def install_termux_packages(packages: List[str]) -> None:
         return
     for pkg_name in packages:
         try:
-            result = run_command(["pkg", "list-installed"], timeout=60)
-            installed = (result.stdout or "")
-            if pkg_name in installed:
+            installed_output = run_command(["pkg", "list-installed"], timeout=60)
+            if pkg_name in (installed_output.stdout or ""):
                 continue
-            res = run_command(["pkg", "install", "-y", pkg_name], timeout=600)
-            if res.returncode != 0:
-                print(f"[WARN] Failed to install package '{pkg_name}': {res.stderr.strip() or res.stdout.strip()}")
+            result = run_command(["pkg", "install", "-y", pkg_name], timeout=600)
+            if result.returncode != 0:
+                print(f"[WARN] pkg install failed for '{pkg_name}': {result.stderr.strip() or result.stdout.strip()}")
         except Exception as exc:
             print(f"[WARN] Exception installing '{pkg_name}': {exc}")
 
@@ -77,23 +70,33 @@ def install_debian_packages(packages: List[str]) -> None:
 
     for pkg_name in packages:
         try:
-            res = run_command(["apt-get", "install", "-y", pkg_name], timeout=600)
-            if res.returncode != 0:
-                print(f"[WARN] Failed to apt-get install '{pkg_name}': {res.stderr.strip() or res.stdout.strip()}")
+            result = run_command(["apt-get", "install", "-y", pkg_name], timeout=600)
+            if result.returncode != 0:
+                print(f"[WARN] apt-get failed for '{pkg_name}': {result.stderr.strip() or result.stdout.strip()}")
         except Exception as exc:
             print(f"[WARN] Exception apt-get installing '{pkg_name}': {exc}")
 
-def ensure_native_system_dependencies() -> None:
+def ensure_native_dependencies() -> None:
     if TERMUX:
-        # Required because lxml compilation needs libxml2/libxslt native headers
-        install_termux_packages(["ffmpeg", "libxml2", "libxslt", "libxml2-dev", "libxslt-dev"])
+        install_termux_packages([
+            "ffmpeg",
+            "libxml2",
+            "libxslt",
+            "libxml2-dev",
+            "libxslt-dev",
+            "clang",
+            "make",
+            "pkg-config",
+        ])
     elif DEBIAN:
-        install_debian_packages(["ffmpeg", "libxml2-dev", "libxslt1.1", "libxslt-dev"])
-    else:
-        # Generic fallback
-        for tool in ["ffmpeg"]:
-            if shutil.which(tool) is None:
-                raise RuntimeError(f"Missing required system dependency: {tool}. Install it manually.")
+        install_debian_packages([
+            "ffmpeg",
+            "libxml2-dev",
+            "libxslt1.1",
+            "libxslt-dev",
+            "build-essential",
+            "pkg-config",
+        ])
 
 def ensure_python_dependencies() -> None:
     for package in REQUIRED_PYTHON:
@@ -104,9 +107,8 @@ def ensure_python_dependencies() -> None:
         except Exception:
             pass
 
-        # Special-case for lxml in Termux: ensure native libs are present first
         if package == "lxml":
-            ensure_native_system_dependencies()
+            ensure_native_dependencies()
 
         install_cmd = [
             sys.executable,
@@ -126,11 +128,11 @@ def ensure_python_dependencies() -> None:
             details = stderr or stdout or "Unknown pip error"
             raise RuntimeError(f"Failed to install Python package '{package}': {details}")
 
-ensure_native_system_dependencies()
+ensure_native_dependencies()
 ensure_python_dependencies()
 
 # -------------------------------------------------------------------
-# Now import third-party packages
+# Third-party imports after dependency bootstrap
 # -------------------------------------------------------------------
 
 import requests
@@ -141,7 +143,7 @@ from jinja2 import Template
 import uvicorn
 import yt_dlp
 
-APP_TITLE = "Termux Media Search & Stream"
+APP_TITLE = "Termux Movie Stream"
 APP_VERSION = "1.0.0"
 
 # -------------------------------------------------------------------
@@ -162,17 +164,29 @@ def safe_int(value: Any, default: int = 0) -> int:
 
 def canonical_query(raw_query: str) -> str:
     q = safe_text(raw_query, "")
-    q = q.replace("\\n", " ").replace("\\r", " ")
-    q = re.sub(r"\\s+", " ", q)
+    q = q.replace("\n", " ").replace("\r", " ")
+    q = re.sub(r"\s+", " ", q)
     return q.strip()
+
+def youtube_watch_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
+
+def normalize_thumbnail_url(raw_url: str) -> str:
+    if not raw_url:
+        return ""
+    url = raw_url.strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    return url
 
 def format_duration(seconds: Optional[int]) -> str:
     if seconds is None:
         return "N/A"
     try:
         seconds = int(seconds)
-    except (TypeError, ValueError):
+    except Exception:
         return "N/A"
+
     if seconds < 60:
         return f"{seconds}s"
     minutes, secs = divmod(seconds, 60)
@@ -184,76 +198,99 @@ def format_duration(seconds: Optional[int]) -> str:
 def display_label(height: Optional[int], tbr: Optional[int]) -> str:
     target = height or tbr
     if target is None:
-        return "Auto"
+        return "HD"
     return f"{target}p"
 
-def build_language_variants(query: str, language: str) -> List[str]:
-    cleaned = canonical_query(query)
-    if not cleaned:
+# -------------------------------------------------------------------
+# Search result parsing from YouTube public HTML
+# -------------------------------------------------------------------
+
+def extract_runs_text(runs: List[Dict[str, Any]]) -> str:
+    if not isinstance(runs, list):
+        return ""
+    texts: List[str] = []
+    for item in runs:
+        if isinstance(item, dict):
+            text = safe_text(item.get("text"), "")
+            if text:
+                texts.append(text)
+    return " ".join(texts).strip()
+
+def youtube_video_data_from_html(html_text: str, max_results: int = 12) -> List[Dict[str, Any]]:
+    match = re.search(r'ytInitialData\s*=\s*({.*?})\s*;\s*(?:var\s+\w+|</script>)', html_text, re.S)
+    if not match:
         return []
 
-    base = cleaned
-    language_map = {
-        "all": [
-            base,
-            f"{base} movie",
-            f"{base} full movie",
-            f"{base} latest",
-            f"{base} dubbed",
-            f"{base} hd",
-            f"{base} 1080p",
-        ],
-        "hindi": [
-            f"{base} hindi movie",
-            f"{base} hindi dubbed movie",
-            f"{base} bollywood movie",
-            f"{base} latest hindi movie",
-            f"{base} hindi full movie",
-        ],
-        "english": [
-            f"{base} english movie",
-            f"{base} hollywood movie",
-            f"{base} latest english film",
-            f"{base} english action movie",
-            f"{base} english 1080p",
-        ],
-        "south indian": [
-            f"{base} south indian movie",
-            f"{base} tamil movie",
-            f"{base} telugu movie",
-            f"{base} kannada movie",
-            f"{base} malayalam movie",
-            f"{base} south indian dubbed",
-        ],
-        "regional": [
-            f"{base} marathi movie",
-            f"{base} bengali movie",
-            f"{base} gujarati movie",
-            f"{base} punjabi movie",
-            f"{base} odia movie",
-            f"{base} regional movie",
-            f"{base} hindi regional dubbed",
-        ],
-    }
+    try:
+        data = json.loads(match.group(1))
+    except Exception:
+        return []
 
-    variants = language_map.get(language.lower(), language_map["all"])
-    unique: List[str] = []
+    videos: List[Dict[str, Any]] = []
     seen = set()
-    for variant in variants:
-        normalized = canonical_query(variant)
-        if not normalized or normalized in seen:
-            continue
-        unique.append(normalized)
-        seen.add(normalized)
-    return unique[:8]
 
-# -------------------------------------------------------------------
-# Media extraction engine
-# -------------------------------------------------------------------
+    def walk(node: Any) -> None:
+        if len(videos) >= max_results:
+            return
+
+        if isinstance(node, dict):
+            if "videoRenderer" in node:
+                renderer = node["videoRenderer"]
+                video_id = safe_text(renderer.get("videoId"))
+                if not video_id or video_id in seen:
+                    return
+                seen.add(video_id)
+
+                title_obj = renderer.get("title", {})
+                title = ""
+                if isinstance(title_obj, dict):
+                    title = extract_runs_text(title_obj.get("runs", []))
+                if not title:
+                    title = safe_text(renderer.get("title"), "Untitled Video")
+
+                thumbnail = ""
+                thumbnail_obj = renderer.get("thumbnail", {})
+                if isinstance(thumbnail_obj, dict):
+                    thumbs = thumbnail_obj.get("thumbnails", []) or []
+                    if thumbs:
+                        thumbnail = normalize_thumbnail_url(thumbs[-1].get("url", ""))
+
+                if not thumbnail:
+                    thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+                duration = ""
+                length = renderer.get("lengthText")
+                if isinstance(length, dict):
+                    duration = safe_text(length.get("simpleText", ""))
+                elif isinstance(length, str):
+                    duration = safe_text(length)
+
+                url = youtube_watch_url(video_id)
+                if url:
+                    videos.append({
+                        "id": video_id,
+                        "title": title,
+                        "url": url,
+                        "thumbnail": thumbnail,
+                        "duration": duration or "N/A",
+                        "provider": "YouTube",
+                    })
+                    if len(videos) >= max_results:
+                        return
+
+            for value in node.values():
+                walk(value)
+
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    return videos
 
 def extract_best_stream(webpage_url: str) -> Dict[str, Any]:
     if not webpage_url:
-        return {"url": "", "label": "Direct", "height": 0}
+        return {"url": "", "label": "HD", "height": 0}
 
     ydl_opts = {
         "quiet": True,
@@ -270,15 +307,15 @@ def extract_best_stream(webpage_url: str) -> Dict[str, Any]:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(webpage_url, download=False)
     except Exception:
-        return {"url": webpage_url, "label": "Direct", "height": 0}
+        return {"url": webpage_url, "label": "HD", "height": 0}
 
     if not isinstance(info, dict):
-        return {"url": webpage_url, "label": "Direct", "height": 0}
+        return {"url": webpage_url, "label": "HD", "height": 0}
 
     formats = info.get("formats", []) or []
     if not formats:
         direct_url = info.get("url") or info.get("webpage_url") or webpage_url
-        return {"url": direct_url, "label": "Direct", "height": 0}
+        return {"url": direct_url, "label": "HD", "height": 0}
 
     filtered: List[Dict[str, Any]] = []
     for fmt in formats:
@@ -307,148 +344,218 @@ def extract_best_stream(webpage_url: str) -> Dict[str, Any]:
     best = filtered_sorted[0]
     stream_url = best.get("url") or webpage_url
     height = safe_int(best.get("height"), 0)
-    label = display_label(height, safe_int(best.get("tbr"), 0))
-    return {"url": stream_url, "label": label, "height": height}
+    return {"url": stream_url, "label": display_label(height, safe_int(best.get("tbr"), 0)), "height": height}
 
-def search_youtube(query: str, limit: int = 10) -> List[Dict[str, Any]]:
+def search_youtube(query: str, limit: int = 12) -> List[Dict[str, Any]]:
     q = canonical_query(query)
     if not q:
         return []
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "extract_flat": False,
-        "noplaylist": True,
-        "geo_bypass": True,
-        "nocheckcertificate": True,
-        "ignoreerrors": True,
-        "socket_timeout": 20,
+    search_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(q)}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
+        response = requests.get(search_url, headers=headers, timeout=25, allow_redirects=True)
+        response.raise_for_status()
     except Exception:
         return []
 
-    entries = info.get("entries", []) if isinstance(info, dict) else []
+    html_text = response.text
+    parsed = youtube_video_data_from_html(html_text, max_results=limit)
+
+    if not parsed:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "extract_flat": True,
+            "geo_bypass": True,
+            "nocheckcertificate": True,
+            "ignoreerrors": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
+            entries = info.get("entries", []) if isinstance(info, dict) else []
+            parsed = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                vid = safe_text(entry.get("id") or "")
+                if not vid:
+                    continue
+                parsed.append({
+                    "id": vid,
+                    "title": safe_text(entry.get("title"), "Video"),
+                    "url": youtube_watch_url(vid),
+                    "thumbnail": safe_text(entry.get("thumbnail") or "", ""),
+                    "duration": format_duration(safe_int(entry.get("duration"), 0)),
+                    "provider": "YouTube",
+                })
+        except Exception:
+            parsed = []
+
     results: List[Dict[str, Any]] = []
-
-    for item in entries:
-        if not isinstance(item, dict):
+    for item in parsed:
+        watch_url = safe_text(item.get("url"), "")
+        if not watch_url:
             continue
-
-        title = safe_text(item.get("title"), "Unknown Title")
-        webpage_url = safe_text(item.get("webpage_url") or item.get("url"), "")
-        thumbnail = safe_text(item.get("thumbnail") or "", "")
-        if not webpage_url:
-            continue
-
-        stream_data = extract_best_stream(webpage_url)
-        stream_url = stream_data.get("url") or webpage_url
-        label = stream_data.get("label") or "Direct"
-
+        stream_info = extract_best_stream(watch_url)
+        stream_url = stream_info.get("url") or watch_url
         results.append({
-            "title": title,
-            "url": webpage_url,
+            "title": safe_text(item.get("title"), "Video"),
+            "url": watch_url,
             "stream_url": stream_url,
             "download_url": stream_url,
-            "thumbnail": thumbnail,
-            "resolution": label,
-            "duration": format_duration(safe_int(item.get("duration"), 0)),
-            "provider": "YouTube",
+            "thumbnail": safe_text(item.get("thumbnail"), ""),
+            "resolution": stream_info.get("label") or "HD",
+            "duration": safe_text(item.get("duration"), "N/A"),
+            "provider": safe_text(item.get("provider"), "YouTube"),
             "language": q,
         })
-    return results
+    return results[:limit]
 
-def extract_links_from_public_html(url: str) -> List[str]:
+def build_language_variants(query: str, language: str) -> List[str]:
+    q = canonical_query(query)
+    if not q:
+        return []
+    base = q
+
+    variants_map = {
+        "all": [
+            base,
+            f"{base} movie",
+            f"{base} full movie",
+            f"{base} latest movie",
+            f"{base} dubbed",
+            f"{base} hd",
+            f"{base} watch online",
+        ],
+        "hindi": [
+            f"{base} hindi movie",
+            f"{base} latest hindi movie",
+            f"{base} hindi dubbed movie",
+            f"{base} bollywood movie",
+            f"{base} hindi full movie",
+        ],
+        "english": [
+            f"{base} english movie",
+            f"{base} latest english movie",
+            f"{base} hollywood movie",
+            f"{base} english full movie",
+            f"{base} english 1080p",
+        ],
+        "south indian": [
+            f"{base} south indian movie",
+            f"{base} tamil movie",
+            f"{base} telugu movie",
+            f"{base} malayalam movie",
+            f"{base} kannada movie",
+        ],
+        "regional": [
+            f"{base} marathi movie",
+            f"{base} bengali movie",
+            f"{base} gujarati movie",
+            f"{base} punjabi movie",
+            f"{base} regional movie",
+        ],
+    }
+
+    variants = variants_map.get(language.lower(), variants_map["all"])
+    unique: List[str] = []
+    seen = set()
+    for variant in variants:
+        normalized = canonical_query(variant)
+        if normalized and normalized not in seen:
+            unique.append(normalized)
+            seen.add(normalized)
+    return unique[:8]
+
+def search_generic_web(query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    search_url = f"https://www.bing.com/search?q={urllib.parse.quote(query + ' video download')}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
-        }
-        response = requests.get(url, timeout=25, headers=headers, allow_redirects=True)
+        response = requests.get(search_url, headers=headers, timeout=20, allow_redirects=True)
         response.raise_for_status()
     except Exception:
         return []
 
     soup = BeautifulSoup(response.text, "lxml")
-    links = set()
+    found: List[Dict[str, Any]] = []
+    seen = set()
 
-    for tag in soup.find_all("a", href=True):
-        href = tag["href"]
+    for link in soup.select("a[href]"):
+        href = link.get("href", "")
         if not href:
             continue
-        full = requests.compat.urljoin(url, href)
-        if re.search(r"(youtube\\.com/watch|youtube\\.com/shorts|vimeo\\.com|\\.mp4|\\.m3u8|\\.m3u|\\.webm|/embed/)", full, re.IGNORECASE):
-            links.add(full)
+        raw = href.strip()
+        if raw.startswith("javascript:") or not raw.startswith("http"):
+            continue
+        if "youtube.com" not in raw.lower() and ".mp4" not in raw.lower() and ".m3u8" not in raw.lower() and ".mpd" not in raw.lower():
+            continue
+        if raw in seen:
+            continue
+        seen.add(raw)
 
-    return sorted(links)[:25]
+        title = safe_text(link.get_text(" ", strip=True), "Video")
+        if not title:
+            title = "Video"
 
-def search_generic_public_index(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    search_targets = [
-        f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}",
-        f"https://www.bing.com/search?q={urllib.parse.quote(query + ' video')}",
-    ]
+        stream_info = extract_best_stream(raw)
+        found.append({
+            "title": title[:90],
+            "url": raw,
+            "stream_url": stream_info.get("url") or raw,
+            "download_url": stream_info.get("url") or raw,
+            "thumbnail": "",
+            "resolution": stream_info.get("label") or "HD",
+            "duration": "N/A",
+            "provider": "Public Web",
+            "language": query,
+        })
+        if len(found) >= limit:
+            break
+
+    return found
+
+def search_public_media(query: str, language: str = "all", max_results: int = 12) -> List[Dict[str, Any]]:
+    q = canonical_query(query)
+    if not q:
+        return []
 
     results: List[Dict[str, Any]] = []
     seen = set()
 
-    for target in search_targets:
-        for href in extract_links_from_public_html(target):
-            if href in seen:
-                continue
-            seen.add(href)
-            if "youtube.com/watch" in href.lower() or "youtube.com/shorts" in href.lower():
-                stream_data = extract_best_stream(href)
-                title = safe_text(re.sub(r"\\s+", " ", href.split("v=")[-1] if "youtube.com/watch" in href.lower() else href), "Video")
-                results.append({
-                    "title": title[:80] if title else "Public Video",
-                    "url": href,
-                    "stream_url": stream_data.get("url") or href,
-                    "download_url": stream_data.get("url") or href,
-                    "thumbnail": "",
-                    "resolution": stream_data.get("label") or "Direct",
-                    "duration": "N/A",
-                    "provider": "Public Index",
-                    "language": query,
-                })
-                if len(results) >= limit:
-                    return results
-    return results
-
-def search_public_media(query: str, language: str = "all", max_results: int = 12) -> List[Dict[str, Any]]:
-    cleaned = canonical_query(query)
-    if not cleaned:
-        return []
-
-    combined: List[Dict[str, Any]] = []
-    seen = set()
-
-    for variant in build_language_variants(cleaned, language):
-        for result in search_youtube(variant, limit=5):
-            key = (result.get("title"), result.get("stream_url"))
+    for variant in build_language_variants(q, language):
+        for item in search_youtube(variant, limit=5):
+            key = (item.get("title"), item.get("stream_url"))
             if key in seen:
                 continue
             seen.add(key)
-            combined.append(result)
-            if len(combined) >= max_results:
-                return combined
+            results.append(item)
+            if len(results) >= max_results:
+                return results
 
-        for result in search_generic_public_index(variant, limit=3):
-            key = (result.get("title"), result.get("stream_url"))
+        for item in search_generic_web(variant, limit=3):
+            key = (item.get("title"), item.get("stream_url"))
             if key in seen:
                 continue
             seen.add(key)
-            combined.append(result)
-            if len(combined) >= max_results:
-                return combined
+            results.append(item)
+            if len(results) >= max_results:
+                return results
 
-    return combined[:max_results]
+    return results[:max_results]
 
 # -------------------------------------------------------------------
-# FastAPI + HTML UI
+# FastAPI app
 # -------------------------------------------------------------------
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
@@ -472,7 +579,6 @@ HTML_TEMPLATE = Template("""
       --primary-2: #66d9ef;
       --success: #2ae0a4;
       --danger: #ff627d;
-      --shadow: rgba(10, 15, 30, 0.6);
       --border: rgba(148, 163, 184, 0.12);
     }
     * { box-sizing: border-box; }
@@ -500,7 +606,7 @@ HTML_TEMPLATE = Template("""
       border: 1px solid var(--border);
       border-radius: 18px;
       margin-bottom: 16px;
-      box-shadow: 0 12px 30px var(--shadow);
+      box-shadow: 0 12px 30px rgba(10, 15, 30, 0.6);
     }
     .toolbar-inner {
       display: flex;
@@ -533,7 +639,7 @@ HTML_TEMPLATE = Template("""
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      width: min(640px, 100%);
+      width: min(660px, 100%);
       margin-left: auto;
     }
     .search-field {
@@ -639,7 +745,12 @@ HTML_TEMPLATE = Template("""
       overflow: hidden;
       background: #0f172a;
     }
-    .thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .thumb {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
     .badge-time {
       position: absolute;
       right: 10px;
@@ -789,7 +900,7 @@ HTML_TEMPLATE = Template("""
           <span>{{ title }}</span>
         </div>
         <form id="searchForm" class="search-box">
-          <input id="query" class="search-field" type="text" placeholder="Search Hindi, English, South Indian, Regional..." value="latest hindi movies" />
+          <input id="query" class="search-field" type="text" placeholder="Search Hindi, English, South Indian, Regional..." value="latest hindi movie" />
           <select id="language" class="search-field">
             <option value="all">All</option>
             <option value="hindi">Hindi</option>
@@ -803,16 +914,16 @@ HTML_TEMPLATE = Template("""
     </div>
 
     <section class="hero">
-      <h1>Stream Real Media from Public Search Results</h1>
-      <p>Search across Hindi, English, South Indian dubbed, and regional titles. Each card contains a native mobile-friendly player, quick playback, and direct download action.</p>
+      <h1>Play Movies from Public Search</h1>
+      <p>Search across Hindi, English, South Indian, and regional titles. Each result shows a thumbnail, stream button, and download button.</p>
       <div class="status-row">
-        <div class="badge"><span class="dot"></span> Ready for Termux / Mobile</div>
-        <div class="badge">FastAPI + yt-dlp + HTML5 Player</div>
+        <div class="badge"><span class="dot"></span> Mobile-friendly</div>
+        <div class="badge">FastAPI + YouTube Search + HTML5 Player</div>
       </div>
     </section>
 
     <div class="results-head">
-      <h2>Results</h2>
+      <h2>Movies</h2>
       <div id="status" class="hint">Loading...</div>
     </div>
 
@@ -851,13 +962,12 @@ HTML_TEMPLATE = Template("""
       card.className = 'card';
 
       const thumbnailUrl = item.thumbnail || 'https://images.unsplash.com/photo-1492691527719-9d1e07e534b4?auto=format&fit=crop&w=1200&q=80';
-
       const streamUrl = item.stream_url || item.url || '';
       const downloadUrl = item.download_url || item.stream_url || item.url || '';
 
       card.innerHTML = `
         <div class="thumb-wrap">
-          <img class="thumb" src="${thumbnailUrl}" alt="${escapeHtml(item.title || 'Video')}" loading="lazy" />
+          <img class="thumb" src="${thumbnailUrl}" alt="${escapeHtml(item.title || 'Movie')}" loading="lazy" />
           <div class="badge-time">${escapeHtml(item.duration || 'N/A')}</div>
         </div>
         <div class="card-body">
@@ -867,7 +977,7 @@ HTML_TEMPLATE = Template("""
             <span>${escapeHtml(item.resolution || 'HD')}</span>
           </div>
           <div class="actions">
-            <button class="button primary" type="button" data-action="play" data-url="${escapeHtml(streamUrl)}" data-title="${escapeHtml(item.title || 'Video')}">Play</button>
+            <button class="button primary" type="button" data-action="play" data-url="${escapeHtml(streamUrl)}" data-title="${escapeHtml(item.title || 'Movie')}">Play</button>
             <button class="button danger" type="button" data-action="download" data-url="${escapeHtml(downloadUrl)}">Download</button>
           </div>
         </div>
@@ -878,7 +988,7 @@ HTML_TEMPLATE = Template("""
           const action = button.dataset.action;
           const url = button.dataset.url;
           if (action === 'play') {
-            openModal(url, button.dataset.title || 'Video');
+            openModal(url, button.dataset.title || 'Movie');
           } else if (action === 'download') {
             const target = encodeURIComponent(url);
             window.location.href = `/download?url=${target}`;
@@ -890,7 +1000,7 @@ HTML_TEMPLATE = Template("""
     }
 
     function openModal(url, title) {
-      modalTitle.textContent = title || 'Stream';
+      modalTitle.textContent = title || 'Movie';
       videoPlayer.src = url;
       modal.classList.add('show');
       videoPlayer.play().catch(() => {});
@@ -904,28 +1014,28 @@ HTML_TEMPLATE = Template("""
     }
 
     async function fetchResults(query, language) {
-      statusEl.textContent = 'Searching…';
+      statusEl.textContent = 'Searching...';
       resultsEl.innerHTML = '';
 
       try {
-        const url = `/api/search?q=${encodeURIComponent(query)}&language=${encodeURIComponent(language)}&limit=12`;
-        const response = await fetch(url);
+        const response = await fetch(`/api/search?q=${encodeURIComponent(query)}&language=${encodeURIComponent(language)}&limit=12`);
         const payload = await response.json();
-
         const items = payload.results || [];
 
         if (!items.length) {
           statusEl.textContent = 'No results found.';
-          resultsEl.innerHTML = '<div class=\"empty\">No public media matches were found. Try another language or keyword.</div>';
+          resultsEl.innerHTML = '<div class=\"empty\">No public movie results found. Try a different query or language.</div>';
           return;
         }
 
-        statusEl.textContent = `${items.length} result${items.length > 1 ? 's' : ''} found for "${query}"`;
-        items.forEach((item) => resultsEl.appendChild(renderCard(item)));
+        statusEl.textContent = `${items.length} results for "${query}"`;
+        items.forEach((item) => {
+          resultsEl.appendChild(renderCard(item));
+        });
       } catch (error) {
         console.error(error);
         statusEl.textContent = 'Search failed.';
-        resultsEl.innerHTML = '<div class=\"empty\">Something went wrong while fetching results. Please try again.</div>';
+        resultsEl.innerHTML = '<div class=\"empty\">Could not fetch results. Please try again in a moment.</div>';
       }
     }
 
@@ -947,8 +1057,39 @@ HTML_TEMPLATE = Template("""
       }
     });
 
+    async function loadDefaultMovies() {
+      const queries = [
+        'latest hindi movie',
+        'latest english movie',
+        'south indian movie',
+        'regional movie',
+      ];
+      const language = 'all';
+      let all = [];
+      for (const q of queries) {
+        try {
+          const response = await fetch(`/api/search?q=${encodeURIComponent(q)}&language=${encodeURIComponent(language)}&limit=6`);
+          const payload = await response.json();
+          const rows = payload.results || [];
+          for (const item of rows) {
+            if (!all.some((x) => (x.title === item.title && x.stream_url === item.stream_url))) {
+              all.push(item);
+            }
+          }
+        } catch (error) {
+          console.error(error);
+        }
+      }
+      statusEl.textContent = all.length ? 'Showing popular movie results' : 'No public results loaded';
+      if (!all.length) {
+        resultsEl.innerHTML = '<div class=\"empty\">No public movie results found right now. Search manually to try another title.</div>';
+        return;
+      }
+      all.slice(0, 12).forEach((item) => resultsEl.appendChild(renderCard(item)));
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
-      fetchResults('latest hindi movies', 'hindi');
+      loadDefaultMovies();
     });
   </script>
 </body>
@@ -957,8 +1098,7 @@ HTML_TEMPLATE = Template("""
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
-    rendered = HTML_TEMPLATE.render(title=APP_TITLE)
-    return HTMLResponse(content=rendered)
+    return HTMLResponse(content=HTML_TEMPLATE.render(title=APP_TITLE))
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
@@ -970,9 +1110,9 @@ async def health() -> Dict[str, Any]:
     }
 
 @app.get("/api/search")
-async def search_endpoint(
-    q: str = Query(..., description="Search query", min_length=1),
-    language: str = Query("all", description="Language filter: all, hindi, english, south indian, regional"),
+async def api_search(
+    q: str = Query(..., min_length=1),
+    language: str = Query("all"),
     limit: int = Query(12, ge=1, le=25),
 ) -> JSONResponse:
     query = canonical_query(q)
@@ -990,7 +1130,7 @@ async def search_endpoint(
 @app.get("/download")
 async def download_media(url: str = Query(...)) -> StreamingResponse:
     if not url:
-        raise HTTPException(status_code=400, detail="Missing url")
+        raise HTTPException(status_code=400, detail="Missing download url")
 
     decoded_url = urllib.parse.unquote(url)
     headers = {
@@ -1002,7 +1142,7 @@ async def download_media(url: str = Query(...)) -> StreamingResponse:
         response = requests.get(decoded_url, stream=True, timeout=60, headers=headers, allow_redirects=True)
         response.raise_for_status()
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch download stream: {exc}")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch stream: {exc}")
 
     filename = decoded_url.split("/")[-1] or "download.bin"
     if not filename.lower().endswith((".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".ts", ".mov", ".avi")):
@@ -1018,7 +1158,7 @@ async def download_media(url: str = Query(...)) -> StreamingResponse:
     )
 
 def main() -> None:
-    print(f"[{APP_TITLE}] Starting server on 0.0.0.0:8000")
+    print(f"[{APP_TITLE}] Starting on http://0.0.0.0:8000")
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False, log_level="info")
 
 if __name__ == "__main__":
