@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # app.py
-# Production-ready single-file Android Termux app: media search + streaming UI + downloader
-# Run:
-#   python app.py
-# Then browse:
-#   http://127.0.0.1:8000
+# Production-ready single-file Android Termux app:
+# media search, HTML5 streaming UI, direct downloads, auto bootstrapping
 
 import json
 import os
@@ -14,9 +11,12 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-# Bootstrap dependency installation before importing third-party libraries.
+# -------------------------------------------------------------------
+# Auto-bootstrap dependencies before any third-party import
+# -------------------------------------------------------------------
+
 REQUIRED_PYTHON = [
     "fastapi",
     "uvicorn",
@@ -26,7 +26,12 @@ REQUIRED_PYTHON = [
     "lxml",
     "jinja2",
 ]
-REQUIRED_SYSTEM = ["ffmpeg"]
+
+REQUIRED_SYSTEM = [
+    "ffmpeg",
+    "libxml2",
+    "libxslt",
+]
 
 MODULE_MAP = {
     "fastapi": "fastapi",
@@ -38,20 +43,57 @@ MODULE_MAP = {
     "jinja2": "jinja2",
 }
 
-def run_command(command: List[str], timeout: int = 600) -> subprocess.CompletedProcess:
-    return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+TERMUX = os.path.exists("/data/data/com.termux/files/usr/bin/pkg")
+DEBIAN = shutil.which("apt-get") is not None
 
-def ensure_system_dependencies() -> None:
-    for tool in REQUIRED_SYSTEM:
-        if shutil.which(tool) is not None:
-            continue
-        if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
-            subprocess.run(["pkg", "install", "-y", tool], check=False)
-        elif shutil.which("apt-get"):
-            subprocess.run(["apt-get", "update"], check=False)
-            subprocess.run(["apt-get", "install", "-y", tool], check=False)
-        else:
-            raise RuntimeError(f"Required system dependency not found and could not be installed: {tool}")
+def run_command(command: List[str], timeout: int = 600) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Command timed out: {' '.join(command)}") from exc
+
+def install_termux_packages(packages: List[str]) -> None:
+    if not TERMUX:
+        return
+    for pkg_name in packages:
+        try:
+            result = run_command(["pkg", "list-installed"], timeout=60)
+            installed = (result.stdout or "")
+            if pkg_name in installed:
+                continue
+            res = run_command(["pkg", "install", "-y", pkg_name], timeout=600)
+            if res.returncode != 0:
+                print(f"[WARN] Failed to install package '{pkg_name}': {res.stderr.strip() or res.stdout.strip()}")
+        except Exception as exc:
+            print(f"[WARN] Exception installing '{pkg_name}': {exc}")
+
+def install_debian_packages(packages: List[str]) -> None:
+    if not DEBIAN:
+        return
+    try:
+        run_command(["apt-get", "update"], timeout=600)
+    except Exception:
+        pass
+
+    for pkg_name in packages:
+        try:
+            res = run_command(["apt-get", "install", "-y", pkg_name], timeout=600)
+            if res.returncode != 0:
+                print(f"[WARN] Failed to apt-get install '{pkg_name}': {res.stderr.strip() or res.stdout.strip()}")
+        except Exception as exc:
+            print(f"[WARN] Exception apt-get installing '{pkg_name}': {exc}")
+
+def ensure_native_system_dependencies() -> None:
+    if TERMUX:
+        # Required because lxml compilation needs libxml2/libxslt native headers
+        install_termux_packages(["ffmpeg", "libxml2", "libxslt", "libxml2-dev", "libxslt-dev"])
+    elif DEBIAN:
+        install_debian_packages(["ffmpeg", "libxml2-dev", "libxslt1.1", "libxslt-dev"])
+    else:
+        # Generic fallback
+        for tool in ["ffmpeg"]:
+            if shutil.which(tool) is None:
+                raise RuntimeError(f"Missing required system dependency: {tool}. Install it manually.")
 
 def ensure_python_dependencies() -> None:
     for package in REQUIRED_PYTHON:
@@ -62,40 +104,67 @@ def ensure_python_dependencies() -> None:
         except Exception:
             pass
 
-        pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--disable-pip-version-check", package]
-        result = run_command(pip_cmd)
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to install Python package '{package}': {result.stderr.strip() or result.stdout.strip()}")
+        # Special-case for lxml in Termux: ensure native libs are present first
+        if package == "lxml":
+            ensure_native_system_dependencies()
 
-ensure_system_dependencies()
+        install_cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--disable-pip-version-check",
+            "--no-cache-dir",
+            package,
+        ]
+
+        result = run_command(install_cmd, timeout=600)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            details = stderr or stdout or "Unknown pip error"
+            raise RuntimeError(f"Failed to install Python package '{package}': {details}")
+
+ensure_native_system_dependencies()
 ensure_python_dependencies()
+
+# -------------------------------------------------------------------
+# Now import third-party packages
+# -------------------------------------------------------------------
 
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from jinja2 import Template
-from lxml import html as lxml_html
 import uvicorn
 import yt_dlp
 
 APP_TITLE = "Termux Media Search & Stream"
 APP_VERSION = "1.0.0"
 
-# -----------------------------
-# Utility helpers
-# -----------------------------
+# -------------------------------------------------------------------
+# Utility functions
+# -------------------------------------------------------------------
 
 def safe_text(value: Any, fallback: str = "") -> str:
     if value is None:
         return fallback
-    return str(value).strip() or fallback
+    text = str(value).strip()
+    return text if text else fallback
 
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
     except Exception:
         return default
+
+def canonical_query(raw_query: str) -> str:
+    q = safe_text(raw_query, "")
+    q = q.replace("\\n", " ").replace("\\r", " ")
+    q = re.sub(r"\\s+", " ", q)
+    return q.strip()
 
 def format_duration(seconds: Optional[int]) -> str:
     if seconds is None:
@@ -118,18 +187,13 @@ def display_label(height: Optional[int], tbr: Optional[int]) -> str:
         return "Auto"
     return f"{target}p"
 
-def canonical_query(raw_query: str) -> str:
-    q = safe_text(raw_query, "")
-    q = q.replace("\n", " ").replace("\r", " ")
-    q = re.sub(r"\s+", " ", q)
-    return q.strip()
-
 def build_language_variants(query: str, language: str) -> List[str]:
     cleaned = canonical_query(query)
     if not cleaned:
         return []
+
     base = cleaned
-    languages = {
+    language_map = {
         "all": [
             base,
             f"{base} movie",
@@ -171,7 +235,8 @@ def build_language_variants(query: str, language: str) -> List[str]:
             f"{base} hindi regional dubbed",
         ],
     }
-    variants = languages.get(language.lower(), languages["all"])
+
+    variants = language_map.get(language.lower(), language_map["all"])
     unique: List[str] = []
     seen = set()
     for variant in variants:
@@ -182,9 +247,9 @@ def build_language_variants(query: str, language: str) -> List[str]:
         seen.add(normalized)
     return unique[:8]
 
-# -----------------------------
+# -------------------------------------------------------------------
 # Media extraction engine
-# -----------------------------
+# -------------------------------------------------------------------
 
 def extract_best_stream(webpage_url: str) -> Dict[str, Any]:
     if not webpage_url:
@@ -200,50 +265,50 @@ def extract_best_stream(webpage_url: str) -> Dict[str, Any]:
         "nocheckcertificate": True,
         "ignoreerrors": True,
     }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(webpage_url, download=False)
-        if not isinstance(info, dict):
-            return {"url": webpage_url, "label": "Direct", "height": 0}
-
-        formats = info.get("formats", []) or []
-        if not formats:
-            # fallback to direct URL if present
-            direct_url = info.get("url") or info.get("webpage_url") or webpage_url
-            return {"url": direct_url, "label": "Direct", "height": 0}
-
-        filtered = []
-        for fmt in formats:
-            if not fmt.get("url"):
-                continue
-            ext = (fmt.get("ext") or "").lower()
-            if ext and ext not in {"mp4", "m4a", "m4v", "webm", "ts", "m3u8", "mpd"}:
-                continue
-            if "manifest" in (fmt.get("format_note") or "").lower():
-                continue
-            filtered.append(fmt)
-
-        if not filtered:
-            filtered = formats
-
-        # Prefer video-compatible streams and highest quality.
-        filtered_sorted = sorted(
-            filtered,
-            key=lambda x: (
-                int(x.get("height") or 0),
-                int(x.get("tbr") or 0),
-                int(x.get("fps") or 0),
-            ),
-            reverse=True,
-        )
-
-        best = filtered_sorted[0]
-        stream_url = best.get("url") or webpage_url
-        height = safe_int(best.get("height"), 0)
-        label = display_label(height, safe_int(best.get("tbr"), 0))
-        return {"url": stream_url, "label": label, "height": height}
     except Exception:
         return {"url": webpage_url, "label": "Direct", "height": 0}
+
+    if not isinstance(info, dict):
+        return {"url": webpage_url, "label": "Direct", "height": 0}
+
+    formats = info.get("formats", []) or []
+    if not formats:
+        direct_url = info.get("url") or info.get("webpage_url") or webpage_url
+        return {"url": direct_url, "label": "Direct", "height": 0}
+
+    filtered: List[Dict[str, Any]] = []
+    for fmt in formats:
+        if not fmt.get("url"):
+            continue
+        ext = (fmt.get("ext") or "").lower()
+        if ext and ext not in {"mp4", "m4a", "m4v", "webm", "ts", "m3u8", "mpd"}:
+            continue
+        if "manifest" in (fmt.get("format_note") or "").lower():
+            continue
+        filtered.append(fmt)
+
+    if not filtered:
+        filtered = formats
+
+    filtered_sorted = sorted(
+        filtered,
+        key=lambda x: (
+            safe_int(x.get("height"), 0),
+            safe_int(x.get("tbr"), 0),
+            safe_int(x.get("fps"), 0),
+        ),
+        reverse=True,
+    )
+
+    best = filtered_sorted[0]
+    stream_url = best.get("url") or webpage_url
+    height = safe_int(best.get("height"), 0)
+    label = display_label(height, safe_int(best.get("tbr"), 0))
+    return {"url": stream_url, "label": label, "height": height}
 
 def search_youtube(query: str, limit: int = 10) -> List[Dict[str, Any]]:
     q = canonical_query(query)
@@ -262,17 +327,19 @@ def search_youtube(query: str, limit: int = 10) -> List[Dict[str, Any]]:
         "socket_timeout": 20,
     }
 
-    results: List[Dict[str, Any]] = []
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
     except Exception:
-        return results
+        return []
 
     entries = info.get("entries", []) if isinstance(info, dict) else []
+    results: List[Dict[str, Any]] = []
+
     for item in entries:
         if not isinstance(item, dict):
             continue
+
         title = safe_text(item.get("title"), "Unknown Title")
         webpage_url = safe_text(item.get("webpage_url") or item.get("url"), "")
         thumbnail = safe_text(item.get("thumbnail") or "", "")
@@ -283,7 +350,7 @@ def search_youtube(query: str, limit: int = 10) -> List[Dict[str, Any]]:
         stream_url = stream_data.get("url") or webpage_url
         label = stream_data.get("label") or "Direct"
 
-        result = {
+        results.append({
             "title": title,
             "url": webpage_url,
             "stream_url": stream_url,
@@ -293,41 +360,43 @@ def search_youtube(query: str, limit: int = 10) -> List[Dict[str, Any]]:
             "duration": format_duration(safe_int(item.get("duration"), 0)),
             "provider": "YouTube",
             "language": q,
-        }
-        results.append(result)
+        })
     return results
 
 def extract_links_from_public_html(url: str) -> List[str]:
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+        }
         response = requests.get(url, timeout=25, headers=headers, allow_redirects=True)
         response.raise_for_status()
     except Exception:
         return []
 
-    page_text = response.text
-    soup = BeautifulSoup(page_text, "lxml")
+    soup = BeautifulSoup(response.text, "lxml")
     links = set()
 
     for tag in soup.find_all("a", href=True):
         href = tag["href"]
         if not href:
             continue
-        href = requests.compat.urljoin(url, href)
-        if re.search(r"(youtube\\.com/watch|youtube\\.com/shorts|vimeo\\.com|\\.mp4|\\.m3u8|\\.m3u|\\.webm|/embed/)", href, re.IGNORECASE):
-            links.add(href)
+        full = requests.compat.urljoin(url, href)
+        if re.search(r"(youtube\\.com/watch|youtube\\.com/shorts|vimeo\\.com|\\.mp4|\\.m3u8|\\.m3u|\\.webm|/embed/)", full, re.IGNORECASE):
+            links.add(full)
 
     return sorted(links)[:25]
 
 def search_generic_public_index(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    candidates = [
+    search_targets = [
         f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}",
         f"https://www.bing.com/search?q={urllib.parse.quote(query + ' video')}",
     ]
+
     results: List[Dict[str, Any]] = []
     seen = set()
-    for candidate in candidates:
-        for href in extract_links_from_public_html(candidate):
+
+    for target in search_targets:
+        for href in extract_links_from_public_html(target):
             if href in seen:
                 continue
             seen.add(href)
@@ -350,14 +419,14 @@ def search_generic_public_index(query: str, limit: int = 5) -> List[Dict[str, An
     return results
 
 def search_public_media(query: str, language: str = "all", max_results: int = 12) -> List[Dict[str, Any]]:
-    cleaned_query = canonical_query(query)
-    if not cleaned_query:
+    cleaned = canonical_query(query)
+    if not cleaned:
         return []
 
     combined: List[Dict[str, Any]] = []
     seen = set()
 
-    for variant in build_language_variants(cleaned_query, language):
+    for variant in build_language_variants(cleaned, language):
         for result in search_youtube(variant, limit=5):
             key = (result.get("title"), result.get("stream_url"))
             if key in seen:
@@ -378,9 +447,9 @@ def search_public_media(query: str, language: str = "all", max_results: int = 12
 
     return combined[:max_results]
 
-# -----------------------------
-# Web app
-# -----------------------------
+# -------------------------------------------------------------------
+# FastAPI + HTML UI
+# -------------------------------------------------------------------
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
@@ -388,8 +457,8 @@ HTML_TEMPLATE = Template("""
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>{{ title }}</title>
   <style>
     :root {
@@ -421,9 +490,7 @@ HTML_TEMPLATE = Template("""
       align-items: center;
       padding: 18px 14px 52px;
     }
-    .container {
-      width: min(1100px, 100%);
-    }
+    .container { width: min(1100px, 100%); }
     .toolbar {
       position: sticky;
       top: 0;
@@ -481,10 +548,7 @@ HTML_TEMPLATE = Template("""
       min-width: 0;
     }
     .search-field::placeholder { color: var(--muted); }
-    select.search-field {
-      max-width: 180px;
-      flex: 0 0 180px;
-    }
+    select.search-field { max-width: 180px; flex: 0 0 180px; }
     .search-button {
       border: none;
       border-radius: 14px;
@@ -549,15 +613,8 @@ HTML_TEMPLATE = Template("""
       gap: 12px;
       margin: 12px 4px 16px;
     }
-    .results-head h2 {
-      margin: 0;
-      font-size: 1.15rem;
-      letter-spacing: 0.03em;
-    }
-    .hint {
-      color: var(--muted);
-      font-size: 0.92rem;
-    }
+    .results-head h2 { margin: 0; font-size: 1.15rem; letter-spacing: 0.03em; }
+    .hint { color: var(--muted); font-size: 0.92rem; }
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -582,12 +639,7 @@ HTML_TEMPLATE = Template("""
       overflow: hidden;
       background: #0f172a;
     }
-    .thumb {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-      display: block;
-    }
+    .thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
     .badge-time {
       position: absolute;
       right: 10px;
@@ -600,9 +652,7 @@ HTML_TEMPLATE = Template("""
       font-size: 0.72rem;
       font-weight: 700;
     }
-    .card-body {
-      padding: 12px 12px 14px;
-    }
+    .card-body { padding: 12px 12px 14px; }
     .title {
       min-height: 44px;
       font-size: 1rem;
@@ -680,9 +730,7 @@ HTML_TEMPLATE = Template("""
       z-index: 50;
       padding: 18px;
     }
-    .modal.show {
-      display: grid;
-    }
+    .modal.show { display: grid; }
     .modal-panel {
       width: min(980px, 100%);
       background: rgba(9, 15, 28, 0.98);
