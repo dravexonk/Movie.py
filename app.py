@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 # app.py
-# Android Termux auto-installer + movie search + streaming UI + download proxy
-# No manual dependency installation required
-# Works with public search results and browser HTML5 playback
+# Premium Movie Search & Streaming App for Android Termux
+# Auto-installs native and Python dependencies
+# Home page with trending films + category tabs + search results + browser player + download
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 from typing import Any, Dict, List, Optional
 
-# -------------------------------------------------------------------
-# Auto-bootstrap dependencies before importing third-party libs
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# Bootstrapping dependencies before importing third-party libs
+# ------------------------------------------------------------
 
 REQUIRED_PYTHON = [
     "fastapi",
@@ -51,8 +53,8 @@ def install_termux_packages(packages: List[str]) -> None:
         return
     for pkg_name in packages:
         try:
-            installed_output = run_command(["pkg", "list-installed"], timeout=60)
-            if pkg_name in (installed_output.stdout or ""):
+            installed = run_command(["pkg", "list-installed"], timeout=60)
+            if pkg_name in (installed.stdout or ""):
                 continue
             result = run_command(["pkg", "install", "-y", pkg_name], timeout=600)
             if result.returncode != 0:
@@ -110,7 +112,7 @@ def ensure_python_dependencies() -> None:
         if package == "lxml":
             ensure_native_dependencies()
 
-        install_cmd = [
+        cmd = [
             sys.executable,
             "-m",
             "pip",
@@ -120,20 +122,17 @@ def ensure_python_dependencies() -> None:
             "--no-cache-dir",
             package,
         ]
-
-        result = run_command(install_cmd, timeout=600)
+        result = run_command(cmd, timeout=600)
         if result.returncode != 0:
-            stderr = (result.stderr or "").strip()
-            stdout = (result.stdout or "").strip()
-            details = stderr or stdout or "Unknown pip error"
-            raise RuntimeError(f"Failed to install Python package '{package}': {details}")
+            err = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"Failed to install '{package}': {err}")
 
 ensure_native_dependencies()
 ensure_python_dependencies()
 
-# -------------------------------------------------------------------
-# Third-party imports after dependency bootstrap
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# Import loaded third-party libs
+# ------------------------------------------------------------
 
 import requests
 from bs4 import BeautifulSoup
@@ -143,12 +142,12 @@ from jinja2 import Template
 import uvicorn
 import yt_dlp
 
-APP_TITLE = "Termux Movie Stream"
+APP_TITLE = "Movie Search Pro"
 APP_VERSION = "1.0.0"
 
-# -------------------------------------------------------------------
-# Utility functions
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 
 def safe_text(value: Any, fallback: str = "") -> str:
     if value is None:
@@ -168,16 +167,16 @@ def canonical_query(raw_query: str) -> str:
     q = re.sub(r"\s+", " ", q)
     return q.strip()
 
+def normalize_url(raw: str) -> str:
+    if not raw:
+        return ""
+    url = raw.strip()
+    if url.startswith("//"):
+        return "https:" + url
+    return url
+
 def youtube_watch_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
-
-def normalize_thumbnail_url(raw_url: str) -> str:
-    if not raw_url:
-        return ""
-    url = raw_url.strip()
-    if url.startswith("//"):
-        url = "https:" + url
-    return url
 
 def format_duration(seconds: Optional[int]) -> str:
     if seconds is None:
@@ -201,19 +200,19 @@ def display_label(height: Optional[int], tbr: Optional[int]) -> str:
         return "HD"
     return f"{target}p"
 
-# -------------------------------------------------------------------
-# Search result parsing from YouTube public HTML
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# YouTube page parsing
+# ------------------------------------------------------------
 
 def extract_runs_text(runs: List[Dict[str, Any]]) -> str:
     if not isinstance(runs, list):
         return ""
-    texts: List[str] = []
+    texts = []
     for item in runs:
         if isinstance(item, dict):
-            text = safe_text(item.get("text"), "")
-            if text:
-                texts.append(text)
+            txt = safe_text(item.get("text"), "")
+            if txt:
+                texts.append(txt)
     return " ".join(texts).strip()
 
 def youtube_video_data_from_html(html_text: str, max_results: int = 12) -> List[Dict[str, Any]]:
@@ -248,22 +247,22 @@ def youtube_video_data_from_html(html_text: str, max_results: int = 12) -> List[
                 if not title:
                     title = safe_text(renderer.get("title"), "Untitled Video")
 
-                thumbnail = ""
-                thumbnail_obj = renderer.get("thumbnail", {})
-                if isinstance(thumbnail_obj, dict):
-                    thumbs = thumbnail_obj.get("thumbnails", []) or []
+                thumb = ""
+                thumb_obj = renderer.get("thumbnail", {})
+                if isinstance(thumb_obj, dict):
+                    thumbs = thumb_obj.get("thumbnails", []) or []
                     if thumbs:
-                        thumbnail = normalize_thumbnail_url(thumbs[-1].get("url", ""))
+                        thumb = normalize_url(thumbs[-1].get("url", ""))
 
-                if not thumbnail:
-                    thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+                if not thumb:
+                    thumb = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
                 duration = ""
-                length = renderer.get("lengthText")
-                if isinstance(length, dict):
-                    duration = safe_text(length.get("simpleText", ""))
-                elif isinstance(length, str):
-                    duration = safe_text(length)
+                length_obj = renderer.get("lengthText")
+                if isinstance(length_obj, dict):
+                    duration = safe_text(length_obj.get("simpleText", ""))
+                elif isinstance(length_obj, str):
+                    duration = safe_text(length_obj)
 
                 url = youtube_watch_url(video_id)
                 if url:
@@ -271,7 +270,7 @@ def youtube_video_data_from_html(html_text: str, max_results: int = 12) -> List[
                         "id": video_id,
                         "title": title,
                         "url": url,
-                        "thumbnail": thumbnail,
+                        "thumbnail": thumb,
                         "duration": duration or "N/A",
                         "provider": "YouTube",
                     })
@@ -287,6 +286,10 @@ def youtube_video_data_from_html(html_text: str, max_results: int = 12) -> List[
 
     walk(data)
     return videos
+
+# ------------------------------------------------------------
+# Best stream extraction
+# ------------------------------------------------------------
 
 def extract_best_stream(webpage_url: str) -> Dict[str, Any]:
     if not webpage_url:
@@ -314,10 +317,10 @@ def extract_best_stream(webpage_url: str) -> Dict[str, Any]:
 
     formats = info.get("formats", []) or []
     if not formats:
-        direct_url = info.get("url") or info.get("webpage_url") or webpage_url
-        return {"url": direct_url, "label": "HD", "height": 0}
+        direct = info.get("url") or info.get("webpage_url") or webpage_url
+        return {"url": direct, "label": "HD", "height": 0}
 
-    filtered: List[Dict[str, Any]] = []
+    filtered = []
     for fmt in formats:
         if not fmt.get("url"):
             continue
@@ -344,9 +347,14 @@ def extract_best_stream(webpage_url: str) -> Dict[str, Any]:
     best = filtered_sorted[0]
     stream_url = best.get("url") or webpage_url
     height = safe_int(best.get("height"), 0)
-    return {"url": stream_url, "label": display_label(height, safe_int(best.get("tbr"), 0)), "height": height}
+    label = display_label(height, safe_int(best.get("tbr"), 0))
+    return {"url": stream_url, "label": label, "height": height}
 
-def search_youtube(query: str, limit: int = 12) -> List[Dict[str, Any]]:
+# ------------------------------------------------------------
+# Search functions
+# ------------------------------------------------------------
+
+def search_youtube(query: str, limit: int = 8) -> List[Dict[str, Any]]:
     q = canonical_query(query)
     if not q:
         return []
@@ -363,8 +371,7 @@ def search_youtube(query: str, limit: int = 12) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
-    html_text = response.text
-    parsed = youtube_video_data_from_html(html_text, max_results=limit)
+    parsed = youtube_video_data_from_html(response.text, max_results=limit)
 
     if not parsed:
         ydl_opts = {
@@ -399,33 +406,91 @@ def search_youtube(query: str, limit: int = 12) -> List[Dict[str, Any]]:
         except Exception:
             parsed = []
 
-    results: List[Dict[str, Any]] = []
+    results = []
+    seen = set()
+
     for item in parsed:
         watch_url = safe_text(item.get("url"), "")
         if not watch_url:
             continue
         stream_info = extract_best_stream(watch_url)
         stream_url = stream_info.get("url") or watch_url
+        title = safe_text(item.get("title"), "Video")
+        thumb = safe_text(item.get("thumbnail"), "")
+        key = (title, stream_url)
+        if key in seen:
+            continue
+        seen.add(key)
+
         results.append({
-            "title": safe_text(item.get("title"), "Video"),
+            "title": title,
             "url": watch_url,
             "stream_url": stream_url,
             "download_url": stream_url,
-            "thumbnail": safe_text(item.get("thumbnail"), ""),
+            "thumbnail": thumb,
             "resolution": stream_info.get("label") or "HD",
             "duration": safe_text(item.get("duration"), "N/A"),
             "provider": safe_text(item.get("provider"), "YouTube"),
             "language": q,
         })
+
     return results[:limit]
+
+def search_generic_web(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    url = f"https://www.bing.com/search?q={urllib.parse.quote(query + ' movie download')}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+        response.raise_for_status()
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(response.text, "lxml")
+    out = []
+    seen = set()
+
+    for a in soup.select("a[href]"):
+        href = safe_text(a.get("href"), "")
+        if not href or href.startswith("javascript:") or not href.startswith("http"):
+            continue
+
+        low = href.lower()
+        if "youtube.com" not in low and ".mp4" not in low and ".m3u8" not in low and ".mpd" not in low and ".webm" not in low:
+            continue
+
+        if href in seen:
+            continue
+        seen.add(href)
+
+        title = safe_text(a.get_text(" ", strip=True), "Video")
+        stream_info = extract_best_stream(href)
+        out.append({
+            "title": title[:95] if title else "Video",
+            "url": href,
+            "stream_url": stream_info.get("url") or href,
+            "download_url": stream_info.get("url") or href,
+            "thumbnail": "",
+            "resolution": stream_info.get("label") or "HD",
+            "duration": "N/A",
+            "provider": "Public Web",
+            "language": query,
+        })
+        if len(out) >= limit:
+            break
+
+    return out
 
 def build_language_variants(query: str, language: str) -> List[str]:
     q = canonical_query(query)
     if not q:
         return []
-    base = q
 
-    variants_map = {
+    base = q
+    lang_map = {
         "all": [
             base,
             f"{base} movie",
@@ -433,19 +498,20 @@ def build_language_variants(query: str, language: str) -> List[str]:
             f"{base} latest movie",
             f"{base} dubbed",
             f"{base} hd",
-            f"{base} watch online",
+            f"{base} 2025",
+            f"{base} official trailer",
         ],
         "hindi": [
             f"{base} hindi movie",
             f"{base} latest hindi movie",
-            f"{base} hindi dubbed movie",
             f"{base} bollywood movie",
+            f"{base} hindi dubbed movie",
             f"{base} hindi full movie",
         ],
         "english": [
             f"{base} english movie",
-            f"{base} latest english movie",
             f"{base} hollywood movie",
+            f"{base} latest english movie",
             f"{base} english full movie",
             f"{base} english 1080p",
         ],
@@ -465,72 +531,22 @@ def build_language_variants(query: str, language: str) -> List[str]:
         ],
     }
 
-    variants = variants_map.get(language.lower(), variants_map["all"])
-    unique: List[str] = []
+    variants = lang_map.get(language.lower(), lang_map["all"])
+    unique = []
     seen = set()
-    for variant in variants:
-        normalized = canonical_query(variant)
-        if normalized and normalized not in seen:
-            unique.append(normalized)
-            seen.add(normalized)
+    for item in variants:
+        norm = canonical_query(item)
+        if norm and norm not in seen:
+            seen.add(norm)
+            unique.append(norm)
     return unique[:8]
-
-def search_generic_web(query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    search_url = f"https://www.bing.com/search?q={urllib.parse.quote(query + ' video download')}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    try:
-        response = requests.get(search_url, headers=headers, timeout=20, allow_redirects=True)
-        response.raise_for_status()
-    except Exception:
-        return []
-
-    soup = BeautifulSoup(response.text, "lxml")
-    found: List[Dict[str, Any]] = []
-    seen = set()
-
-    for link in soup.select("a[href]"):
-        href = link.get("href", "")
-        if not href:
-            continue
-        raw = href.strip()
-        if raw.startswith("javascript:") or not raw.startswith("http"):
-            continue
-        if "youtube.com" not in raw.lower() and ".mp4" not in raw.lower() and ".m3u8" not in raw.lower() and ".mpd" not in raw.lower():
-            continue
-        if raw in seen:
-            continue
-        seen.add(raw)
-
-        title = safe_text(link.get_text(" ", strip=True), "Video")
-        if not title:
-            title = "Video"
-
-        stream_info = extract_best_stream(raw)
-        found.append({
-            "title": title[:90],
-            "url": raw,
-            "stream_url": stream_info.get("url") or raw,
-            "download_url": stream_info.get("url") or raw,
-            "thumbnail": "",
-            "resolution": stream_info.get("label") or "HD",
-            "duration": "N/A",
-            "provider": "Public Web",
-            "language": query,
-        })
-        if len(found) >= limit:
-            break
-
-    return found
 
 def search_public_media(query: str, language: str = "all", max_results: int = 12) -> List[Dict[str, Any]]:
     q = canonical_query(query)
     if not q:
         return []
 
-    results: List[Dict[str, Any]] = []
+    results = []
     seen = set()
 
     for variant in build_language_variants(q, language):
@@ -554,9 +570,75 @@ def search_public_media(query: str, language: str = "all", max_results: int = 12
 
     return results[:max_results]
 
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
+# Trending queries for home tabs
+# ------------------------------------------------------------
+
+TRENDING_MAP = {
+    "trending": [
+        "Spider-Man latest movie",
+        "new Hollywood movie 2025",
+        "latest movie in theaters",
+        "new Hindi movie 2025",
+        "new South Indian movie 2025",
+        "latest Bollywood movie 2025",
+        "Spider-Man official trailer",
+        "latest movie release 2025",
+        "new theater movie 2025",
+        "biggest movie trending 2025",
+        "new Hindi dubbed movie 2025",
+        "new English movie 2025",
+    ],
+    "hindi": [
+        "latest Hindi movie 2025",
+        "new Bollywood movie 2025",
+        "hindi movie release 2025",
+        "latest Hindi dubbed movie 2025",
+        "new Hindi cinema 2025",
+    ],
+    "english": [
+        "latest English movie 2025",
+        "Spider-Man movie",
+        "new Hollywood movie 2025",
+        "latest action movie 2025",
+        "movie release in theaters",
+    ],
+    "south indian": [
+        "latest Tamil movie 2025",
+        "latest Telugu movie 2025",
+        "new South Indian movie 2025",
+        "latest Malayalam movie 2025",
+        "latest Kannada movie 2025",
+    ],
+    "regional": [
+        "latest regional movie 2025",
+        "new Marathi movie 2025",
+        "new Bengali movie 2025",
+        "new Punjabi movie 2025",
+        "new Gujarati movie 2025",
+    ],
+}
+
+def get_trending_movies(category: str = "trending", limit: int = 12) -> List[Dict[str, Any]]:
+    queries = TRENDING_MAP.get(category.lower(), TRENDING_MAP["trending"])
+    results: List[Dict[str, Any]] = []
+    seen = set()
+
+    for query in queries:
+        for item in search_public_media(query, language="all", max_results=4):
+            key = (item.get("title"), item.get("stream_url"))
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(item)
+            if len(results) >= limit:
+                return results
+
+    return results[:limit]
+
+# ------------------------------------------------------------
 # FastAPI app
-# -------------------------------------------------------------------
+# ------------------------------------------------------------
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
@@ -579,307 +661,149 @@ HTML_TEMPLATE = Template("""
       --primary-2: #66d9ef;
       --success: #2ae0a4;
       --danger: #ff627d;
-      --border: rgba(148, 163, 184, 0.12);
+      --border: rgba(148,163,184,0.12);
     }
     * { box-sizing: border-box; }
     html, body {
-      margin: 0;
-      padding: 0;
+      margin: 0; padding: 0;
       background: radial-gradient(circle at top, #122033 0%, var(--bg) 45%, #080d18 100%);
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       min-height: 100%;
     }
     body {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
+      display: flex; flex-direction: column; align-items: center;
       padding: 18px 14px 52px;
     }
-    .container { width: min(1100px, 100%); }
+    .container { width: min(1120px, 100%); }
     .toolbar {
-      position: sticky;
-      top: 0;
-      z-index: 30;
-      background: rgba(9, 15, 28, 0.78);
+      position: sticky; top: 0; z-index: 30;
+      background: rgba(9,15,28,0.78);
       backdrop-filter: blur(12px);
       border: 1px solid var(--border);
       border-radius: 18px;
       margin-bottom: 16px;
-      box-shadow: 0 12px 30px rgba(10, 15, 30, 0.6);
+      box-shadow: 0 12px 30px rgba(10,15,30,0.6);
     }
     .toolbar-inner {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 14px 16px;
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px;
     }
     .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-      color: #f4f8ff;
+      display: flex; align-items: center; gap: 12px; font-weight: 700; letter-spacing: 0.04em; color: #f4f8ff;
     }
     .brand-mark {
-      width: 38px;
-      height: 38px;
-      display: grid;
-      place-items: center;
-      border-radius: 12px;
-      background: linear-gradient(135deg, var(--primary), var(--primary-2));
-      color: #00111f;
-      font-weight: 800;
-      box-shadow: 0 8px 20px rgba(78, 160, 255, 0.25);
+      width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px;
+      background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #00111f; font-weight: 800;
+      box-shadow: 0 8px 20px rgba(78,160,255,0.25);
     }
     .search-box {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      width: min(660px, 100%);
-      margin-left: auto;
+      display: flex; flex-wrap: wrap; gap: 10px; width: min(700px, 100%); margin-left: auto;
     }
     .search-field {
-      flex: 1 1 260px;
-      background: rgba(18, 28, 44, 0.95);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 12px 14px;
-      color: var(--text);
-      font-size: 1rem;
-      outline: none;
-      min-width: 0;
+      flex: 1 1 260px; background: rgba(18,28,44,0.95); border: 1px solid var(--border); border-radius: 14px; padding: 12px 14px;
+      color: var(--text); font-size: 1rem; outline: none; min-width: 0;
     }
     .search-field::placeholder { color: var(--muted); }
     select.search-field { max-width: 180px; flex: 0 0 180px; }
+
     .search-button {
-      border: none;
-      border-radius: 14px;
-      background: linear-gradient(135deg, var(--primary), var(--primary-2));
-      color: #081521;
-      font-weight: 800;
-      padding: 12px 16px;
-      cursor: pointer;
-      min-width: 110px;
+      border: none; border-radius: 14px; background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #081521; font-weight: 800;
+      padding: 12px 16px; cursor: pointer; min-width: 110px;
     }
+
+    .tabs {
+      display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 16px; padding: 0;
+    }
+    .tab-btn {
+      background: rgba(17,24,39,0.88); border: 1px solid var(--border); color: var(--text);
+      border-radius: 12px; padding: 10px 12px; font-weight: 700; cursor: pointer;
+    }
+    .tab-btn.active {
+      background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #071521; border: none;
+    }
+
     .hero {
-      background: linear-gradient(135deg, rgba(30, 41, 59, 0.7), rgba(17, 32, 49, 0.8));
-      border: 1px solid var(--border);
-      border-radius: 22px;
-      padding: 20px;
-      margin-bottom: 18px;
-      box-shadow: 0 18px 40px rgba(3, 7, 18, 0.35);
+      background: linear-gradient(135deg, rgba(30,41,59,0.7), rgba(17,32,49,0.8));
+      border: 1px solid var(--border); border-radius: 22px; padding: 20px; margin-bottom: 18px;
+      box-shadow: 0 18px 40px rgba(3,7,18,0.35);
     }
     .hero h1 {
-      margin: 0 0 8px;
-      font-size: clamp(1.8rem, 4vw, 3rem);
-      line-height: 1.15;
-      letter-spacing: -0.05em;
+      margin: 0 0 8px; font-size: clamp(1.8rem, 4vw, 3rem); line-height: 1.15; letter-spacing: -0.05em;
     }
-    .hero p {
-      margin: 0;
-      color: var(--muted);
-      font-size: 1rem;
-      line-height: 1.6;
-    }
+    .hero p { margin: 0; color: var(--muted); font-size: 1rem; line-height: 1.6; }
     .status-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      margin-top: 18px;
-      flex-wrap: wrap;
+      display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 18px; flex-wrap: wrap;
     }
     .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 12px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: rgba(21, 31, 47, 0.8);
-      color: var(--muted);
-      font-size: 0.9rem;
+      display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; border: 1px solid var(--border);
+      background: rgba(21,31,47,0.8); color: var(--muted); font-size: 0.9rem;
     }
     .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-      background: var(--success);
-      box-shadow: 0 0 12px rgba(42, 224, 164, 0.85);
+      width: 10px; height: 10px; border-radius: 999px; background: var(--success); box-shadow: 0 0 12px rgba(42,224,164,0.85);
     }
     .results-head {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin: 12px 4px 16px;
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin: 12px 4px 16px;
     }
     .results-head h2 { margin: 0; font-size: 1.15rem; letter-spacing: 0.03em; }
     .hint { color: var(--muted); font-size: 0.92rem; }
+
     .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 16px;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px;
     }
     .card {
-      background: linear-gradient(180deg, rgba(17, 24, 39, 0.96), rgba(13, 19, 31, 0.96));
+      background: linear-gradient(180deg, rgba(17,24,39,0.96), rgba(13,19,31,0.96));
       border: 1px solid var(--border);
-      border-radius: 18px;
-      overflow: hidden;
-      box-shadow: 0 12px 28px rgba(3, 7, 18, 0.32);
+      border-radius: 18px; overflow: hidden;
+      box-shadow: 0 12px 28px rgba(3,7,18,0.32);
       transition: transform 0.18s ease, border-color 0.18s ease;
     }
-    .card:hover {
-      transform: translateY(-2px);
-      border-color: rgba(78, 160, 255, 0.5);
-    }
+    .card:hover { transform: translateY(-2px); border-color: rgba(78,160,255,0.5); }
     .thumb-wrap {
-      position: relative;
-      width: 100%;
-      aspect-ratio: 16 / 9;
-      overflow: hidden;
-      background: #0f172a;
+      position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; background: #0f172a;
     }
-    .thumb {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-      display: block;
-    }
+    .thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
     .badge-time {
-      position: absolute;
-      right: 10px;
-      bottom: 10px;
-      background: rgba(10, 13, 20, 0.82);
-      color: white;
-      border: 1px solid rgba(255,255,255,0.11);
-      border-radius: 11px;
-      padding: 4px 8px;
-      font-size: 0.72rem;
-      font-weight: 700;
+      position: absolute; right: 10px; bottom: 10px; background: rgba(10,13,20,0.82); color: white; border: 1px solid rgba(255,255,255,0.11); border-radius: 11px; padding: 4px 8px; font-size: 0.72rem; font-weight: 700;
     }
     .card-body { padding: 12px 12px 14px; }
     .title {
-      min-height: 44px;
-      font-size: 1rem;
-      font-weight: 700;
-      line-height: 1.35;
-      margin: 0 0 8px;
-      color: var(--text);
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
+      min-height: 44px; font-size: 1rem; font-weight: 700; line-height: 1.35; margin: 0 0 8px; color: var(--text);
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
     }
     .meta {
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      align-items: center;
-      color: var(--muted);
-      font-size: 0.82rem;
-      margin-bottom: 12px;
-      flex-wrap: wrap;
+      display: flex; justify-content: space-between; gap: 8px; align-items: center; color: var(--muted); font-size: 0.82rem; margin-bottom: 12px; flex-wrap: wrap;
     }
     .pill {
-      border-radius: 999px;
-      background: rgba(78, 160, 255, 0.12);
-      color: #bfe1ff;
-      border: 1px solid rgba(78, 160, 255, 0.18);
-      padding: 5px 8px;
-      font-weight: 600;
+      border-radius: 999px; background: rgba(78,160,255,0.12); color: #bfe1ff; border: 1px solid rgba(78,160,255,0.18); padding: 5px 8px; font-weight: 600;
     }
-    .actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .button {
-      appearance: none;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: rgba(17, 24, 39, 0.92);
-      color: var(--text);
-      padding: 9px 11px;
-      font-weight: 700;
-      cursor: pointer;
-      flex: 1 1 110px;
-      text-align: center;
-      text-decoration: none;
-      font-size: 0.9rem;
+      appearance: none; border: 1px solid var(--border); border-radius: 10px; background: rgba(17,24,39,0.92); color: var(--text);
+      padding: 9px 11px; font-weight: 700; cursor: pointer; flex: 1 1 110px; text-align: center; text-decoration: none; font-size: 0.9rem;
     }
-    .button.primary {
-      background: linear-gradient(135deg, var(--primary), var(--primary-2));
-      color: #071521;
-      border: none;
-    }
-    .button.danger {
-      background: rgba(255, 98, 125, 0.08);
-      color: #ffc2ce;
-      border-color: rgba(255, 98, 125, 0.2);
-    }
+    .button.primary { background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #071521; border: none; }
+    .button.danger { background: rgba(255,98,125,0.08); color: #ffc2ce; border-color: rgba(255,98,125,0.2); }
     .empty {
-      text-align: center;
-      color: var(--muted);
-      background: rgba(17, 24, 39, 0.7);
-      border: 1px dashed rgba(148, 163, 184, 0.35);
-      border-radius: 18px;
-      padding: 28px 18px;
-      margin-top: 16px;
+      text-align: center; color: var(--muted); background: rgba(17,24,39,0.7); border: 1px dashed rgba(148,163,184,0.35); border-radius: 18px; padding: 28px 18px; margin-top: 16px;
     }
     .modal {
-      position: fixed;
-      inset: 0;
-      background: rgba(2, 6, 15, 0.82);
-      display: none;
-      place-items: center;
-      z-index: 50;
-      padding: 18px;
+      position: fixed; inset: 0; background: rgba(2,6,15,0.82); display: none; place-items: center; z-index: 50; padding: 18px;
     }
     .modal.show { display: grid; }
     .modal-panel {
-      width: min(980px, 100%);
-      background: rgba(9, 15, 28, 0.98);
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      overflow: hidden;
-      box-shadow: 0 24px 80px rgba(0,0,0,0.5);
+      width: min(980px, 100%); background: rgba(9,15,28,0.98); border: 1px solid var(--border); border-radius: 18px; overflow: hidden; box-shadow: 0 24px 80px rgba(0,0,0,0.5);
     }
     .modal-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--border);
-      background: rgba(13, 22, 36, 0.95);
+      display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--border); background: rgba(13,22,36,0.95);
     }
     .modal-title {
-      font-weight: 700;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .close-btn {
-      width: 36px;
-      height: 36px;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: rgba(30,41,59,0.82);
-      color: var(--text);
-      font-size: 1.15rem;
-      cursor: pointer;
+      width: 36px; height: 36px; border: 1px solid var(--border); border-radius: 10px; background: rgba(30,41,59,0.82); color: var(--text); font-size: 1.15rem; cursor: pointer;
     }
     video {
-      width: 100%;
-      height: min(72vh, 600px);
-      display: block;
-      background: #02070f;
-      object-fit: contain;
+      width: 100%; height: min(72vh, 600px); display: block; background: #02070f; object-fit: contain;
     }
     @media (max-width: 640px) {
       .toolbar-inner { padding: 12px; }
@@ -888,6 +812,7 @@ HTML_TEMPLATE = Template("""
       .brand { width: 100%; }
       .hero { padding: 16px; }
       .actions .button { flex: 1 1 100%; }
+      .tabs { overflow-x: auto; white-space: nowrap; }
     }
   </style>
 </head>
@@ -900,7 +825,7 @@ HTML_TEMPLATE = Template("""
           <span>{{ title }}</span>
         </div>
         <form id="searchForm" class="search-box">
-          <input id="query" class="search-field" type="text" placeholder="Search Hindi, English, South Indian, Regional..." value="latest hindi movie" />
+          <input id="query" class="search-field" type="text" placeholder="Search movies..." value="Spider-Man" />
           <select id="language" class="search-field">
             <option value="all">All</option>
             <option value="hindi">Hindi</option>
@@ -913,12 +838,20 @@ HTML_TEMPLATE = Template("""
       </div>
     </div>
 
+    <div class="tabs">
+      <button class="tab-btn active" data-category="trending" type="button">Trending</button>
+      <button class="tab-btn" data-category="hindi" type="button">Hindi</button>
+      <button class="tab-btn" data-category="english" type="button">English</button>
+      <button class="tab-btn" data-category="south indian" type="button">South Indian</button>
+      <button class="tab-btn" data-category="regional" type="button">Regional</button>
+    </div>
+
     <section class="hero">
-      <h1>Play Movies from Public Search</h1>
-      <p>Search across Hindi, English, South Indian, and regional titles. Each result shows a thumbnail, stream button, and download button.</p>
+      <h1>Latest Movies, Trending Now</h1>
+      <p>Spider-Man, new theater releases, Bollywood, Hollywood, South Indian, and regional movie results with thumbnails, streaming, and download options.</p>
       <div class="status-row">
-        <div class="badge"><span class="dot"></span> Mobile-friendly</div>
-        <div class="badge">FastAPI + YouTube Search + HTML5 Player</div>
+        <div class="badge"><span class="dot"></span> Auto-ready for Termux</div>
+        <div class="badge">FastAPI + yt-dlp + HTML5 Player</div>
       </div>
     </section>
 
@@ -947,6 +880,8 @@ HTML_TEMPLATE = Template("""
     const videoPlayer = document.getElementById('videoPlayer');
     const modalTitle = document.getElementById('modalTitle');
     const searchForm = document.getElementById('searchForm');
+    const queryInput = document.getElementById('query');
+    const languageSelect = document.getElementById('language');
 
     function escapeHtml(value = '') {
       return String(value)
@@ -1023,28 +958,77 @@ HTML_TEMPLATE = Template("""
         const items = payload.results || [];
 
         if (!items.length) {
-          statusEl.textContent = 'No results found.';
-          resultsEl.innerHTML = '<div class=\"empty\">No public movie results found. Try a different query or language.</div>';
+          statusEl.textContent = 'No public results found.';
+          resultsEl.innerHTML = '<div class=\"empty\">No results found for this movie title. Try another search or category.</div>';
           return;
         }
 
         statusEl.textContent = `${items.length} results for "${query}"`;
-        items.forEach((item) => {
-          resultsEl.appendChild(renderCard(item));
-        });
+        items.forEach((item) => resultsEl.appendChild(renderCard(item)));
       } catch (error) {
         console.error(error);
         statusEl.textContent = 'Search failed.';
-        resultsEl.innerHTML = '<div class=\"empty\">Could not fetch results. Please try again in a moment.</div>';
+        resultsEl.innerHTML = '<div class=\"empty\">Could not fetch results. Please try again.</div>';
       }
     }
 
+    async function loadTrending(category) {
+      statusEl.textContent = 'Loading trending movies...';
+      resultsEl.innerHTML = '';
+
+      try {
+        const response = await fetch(`/api/trending?category=${encodeURIComponent(category)}`);
+        const payload = await response.json();
+        const items = payload.results || [];
+
+        if (!items.length) {
+          resultsEl.innerHTML = '<div class=\"empty\">No trending movie results found right now.</div>';
+          statusEl.textContent = 'No trending results';
+          return;
+        }
+
+        statusEl.textContent = `${items.length} trending results`;
+        items.forEach((item) => resultsEl.appendChild(renderCard(item)));
+      } catch (error) {
+        console.error(error);
+        statusEl.textContent = 'Trending load failed';
+        resultsEl.innerHTML = '<div class=\"empty\">Trending movies failed to load. Use search manually.</div>';
+      }
+    }
+
+    document.querySelectorAll('.tab-btn').forEach((button) => {
+      button.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach((btn) => btn.classList.remove('active'));
+        button.classList.add('active');
+
+        const category = button.dataset.category || 'trending';
+        if (category === 'trending') {
+          queryInput.value = 'Spider-Man';
+          languageSelect.value = 'all';
+        } else if (category === 'hindi') {
+          queryInput.value = 'latest Hindi movie';
+          languageSelect.value = 'hindi';
+        } else if (category === 'english') {
+          queryInput.value = 'latest English movie';
+          languageSelect.value = 'english';
+        } else if (category === 'south indian') {
+          queryInput.value = 'latest South Indian movie';
+          languageSelect.value = 'south indian';
+        } else {
+          queryInput.value = 'latest regional movie';
+          languageSelect.value = 'regional';
+        }
+
+        loadTrending(category);
+      });
+    });
+
     searchForm.addEventListener('submit', (event) => {
       event.preventDefault();
-      const query = document.getElementById('query').value.trim();
-      const language = document.getElementById('language').value;
+      const query = queryInput.value.trim();
+      const language = languageSelect.value;
       if (!query) {
-        document.getElementById('query').focus();
+        queryInput.focus();
         return;
       }
       fetchResults(query, language);
@@ -1057,39 +1041,8 @@ HTML_TEMPLATE = Template("""
       }
     });
 
-    async function loadDefaultMovies() {
-      const queries = [
-        'latest hindi movie',
-        'latest english movie',
-        'south indian movie',
-        'regional movie',
-      ];
-      const language = 'all';
-      let all = [];
-      for (const q of queries) {
-        try {
-          const response = await fetch(`/api/search?q=${encodeURIComponent(q)}&language=${encodeURIComponent(language)}&limit=6`);
-          const payload = await response.json();
-          const rows = payload.results || [];
-          for (const item of rows) {
-            if (!all.some((x) => (x.title === item.title && x.stream_url === item.stream_url))) {
-              all.push(item);
-            }
-          }
-        } catch (error) {
-          console.error(error);
-        }
-      }
-      statusEl.textContent = all.length ? 'Showing popular movie results' : 'No public results loaded';
-      if (!all.length) {
-        resultsEl.innerHTML = '<div class=\"empty\">No public movie results found right now. Search manually to try another title.</div>';
-        return;
-      }
-      all.slice(0, 12).forEach((item) => resultsEl.appendChild(renderCard(item)));
-    }
-
     document.addEventListener('DOMContentLoaded', () => {
-      loadDefaultMovies();
+      loadTrending('trending');
     });
   </script>
 </body>
@@ -1108,6 +1061,16 @@ async def health() -> Dict[str, Any]:
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "python": sys.version.split()[0],
     }
+
+@app.get("/api/trending")
+async def api_trending(category: str = Query("trending")) -> JSONResponse:
+    category_key = canonical_query(category).lower() or "trending"
+    results = get_trending_movies(category_key, limit=12)
+    return JSONResponse({
+        "category": category_key,
+        "count": len(results),
+        "results": results,
+    })
 
 @app.get("/api/search")
 async def api_search(
@@ -1130,35 +1093,64 @@ async def api_search(
 @app.get("/download")
 async def download_media(url: str = Query(...)) -> StreamingResponse:
     if not url:
-        raise HTTPException(status_code=400, detail="Missing download url")
+        raise HTTPException(status_code=400, detail="Missing url")
 
-    decoded_url = urllib.parse.unquote(url)
+    decoded = urllib.parse.unquote(url)
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
         "Referer": "https://www.youtube.com/",
     }
 
-    try:
-        response = requests.get(decoded_url, stream=True, timeout=60, headers=headers, allow_redirects=True)
-        response.raise_for_status()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch stream: {exc}")
+    # Cache downloaded file locally
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", decoded.split("/")[-1] or "movie")[:80]
+    if not safe_name.lower().endswith((".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".ts", ".mov", ".avi")):
+        safe_name = "movie_download.mp4"
 
-    filename = decoded_url.split("/")[-1] or "download.bin"
-    if not filename.lower().endswith((".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".ts", ".mov", ".avi")):
-        filename = "download.bin"
+    cache_id = hashlib.md5(decoded.encode("utf-8")).hexdigest()
+    file_path = os.path.join(tempfile.gettempdir(), f"movie_stream_{cache_id}_{safe_name}")
+
+    try:
+        if "youtube.com" in decoded.lower() or "youtu.be" in decoded.lower():
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "format": "best[ext=mp4]/best",
+                "outtmpl": file_path,
+                "restrictfilenames": False,
+                "nocheckcertificate": True,
+                "geo_bypass": True,
+                "merge_output_format": "mp4",
+            }
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([decoded])
+        else:
+            response = requests.get(decoded, stream=True, timeout=60, headers=headers, allow_redirects=True)
+            response.raise_for_status()
+            with open(file_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to prepare download: {exc}")
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=502, detail="Download file not generated")
+
+    with open(file_path, "rb") as f:
+        payload = f.read()
 
     return StreamingResponse(
-        response.iter_content(chunk_size=65536),
-        media_type=response.headers.get("Content-Type", "application/octet-stream"),
+        iter([payload]),
+        media_type="video/mp4",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": f'attachment; filename="{os.path.basename(file_path)}"',
             "Cache-Control": "no-store",
         },
     )
 
 def main() -> None:
-    print(f"[{APP_TITLE}] Starting on http://0.0.0.0:8000")
+    print(f"[{APP_TITLE}] Starting server on http://0.0.0.0:8000")
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False, log_level="info")
 
 if __name__ == "__main__":
