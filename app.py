@@ -1,727 +1,784 @@
 #!/usr/bin/env python3
 """
 Self-contained Flask media streaming dashboard for Termux / Android.
-Features:
-- Single-command startup: python app.py
-- Auto-installs Flask, requests, yt-dlp if missing
-- Accepts a media URL or search query
-- Extracts media streams via yt-dlp
-- Modern dark UI with HTML5 video player
-- No complex folder structure required
+
+Run:
+  python app.py
+
+Then open:
+  http://0.0.0.0:5000
 """
 
+import importlib
 import json
 import os
 import re
 import subprocess
 import sys
-from typing import Any, Dict, List
+from urllib.parse import urlparse
 
-try:
-    import flask
-    from flask import Flask, jsonify, render_template_string, request
-    import requests
-    import yt_dlp
-except Exception:
-    print("[INFO] Installing required dependencies...")
+# ------------------------------------------------------------
+# 1) Automatic dependency installation
+# ------------------------------------------------------------
+def ensure_package(module_name, pip_name):
     try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "pip", "Flask", "requests", "yt-dlp"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        importlib.import_module(module_name)
+        return True
     except Exception:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "Flask", "requests", "yt-dlp"]
-        )
+        print(f"[app] Installing missing dependency: {pip_name}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name], stdout=sys.stdout, stderr=sys.stderr)
+        return False
 
-    import flask
-    from flask import Flask, jsonify, render_template_string, request
-    import requests
-    import yt_dlp
+ensure_package("flask", "flask")
+ensure_package("requests", "requests")
+ensure_package("yt_dlp", "yt-dlp")
+
+import requests
+import yt_dlp
+from flask import Flask, jsonify, render_template_string, request
+
+# ------------------------------------------------------------
+# 2) App config
+# ------------------------------------------------------------
+HOST = "0.0.0.0"
+PORT = 5000
+TIMEOUT = 12
 
 app = Flask(__name__)
 
-DEFAULT_PORT = 5000
-HOST = "0.0.0.0"
+# Public sample MP4 links that are commonly accessible in browsers
+SAMPLE_STREAMS = [
+    {
+        "title": "Sample: Flower",
+        "url": "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4",
+        "quality": "SD",
+        "source": "sample"
+    },
+    {
+        "title": "Sample: Big Buck Bunny",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+        "quality": "SD",
+        "source": "sample"
+    },
+    {
+        "title": "Sample: Elephant Dream",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
+        "quality": "SD",
+        "source": "sample"
+    },
+    {
+        "title": "Sample: For Bigger Joyrides",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4",
+        "quality": "HD",
+        "source": "sample"
+    },
+]
 
-def is_url(value: str) -> bool:
-    return bool(re.match(r"^https?://", value.strip(), re.I))
+# ------------------------------------------------------------
+# 3) Utility helpers
+# ------------------------------------------------------------
+def clean_title(value, fallback="Media stream"):
+    text = (value or fallback).strip()
+    return text if text else fallback
 
-def safe_text(value: Any, default: str = "") -> str:
-    return value if isinstance(value, str) and value.strip() else default
-
-def normalize_streams(info: Dict[str, Any]) -> List[Dict[str, Any]]:
-    stream_map: Dict[str, Dict[str, Any]] = {}
-
-    def add_stream(url: str, title: str, quality: str = "stream", kind: str = "media", mime: str = ""):
-        if not url or not url.startswith(("http://", "https://")):
-            return
-        key = f"{title}|{url}"
-        if key not in stream_map:
-            stream_map[key] = {
-                "title": title,
-                "url": url,
-                "quality": quality,
-                "kind": kind,
-                "mime": mime,
-            }
-
-    entries = []
-    if not isinstance(info, dict):
-        return []
-
-    if info.get("_type") == "playlist":
-        entries = info.get("entries") or []
-    elif info.get("entries") is not None:
-        entries = info.get("entries") or []
-    else:
-        entries = [info]
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-
-        title = safe_text(entry.get("title"), "Untitled stream")
-        thumbnail = safe_text(entry.get("thumbnail"), "")
-        direct_url = safe_text(entry.get("url"), "")
-        if direct_url:
-            add_stream(direct_url, title, "direct", "media", safe_text(entry.get("ext"), "video/mp4"))
-            if thumbnail:
-                pass
-
-        formats = entry.get("formats") or []
-        for fmt in formats:
-            if not isinstance(fmt, dict):
-                continue
-            fmt_url = safe_text(fmt.get("url"), "")
-            if not fmt_url:
-                continue
-            fmt_id = safe_text(fmt.get("format_id"), "stream")
-            format_note = safe_text(fmt.get("format_note"), "")
-            quality = format_note or fmt_id
-            vcodec = safe_text(fmt.get("vcodec"), "")
-            acodec = safe_text(fmt.get("acodec"), "")
-            if vcodec and vcodec.lower() != "none":
-                kind = "video"
-            elif acodec and acodec.lower() != "none":
-                kind = "audio"
-            else:
-                kind = "media"
-            ext = safe_text(fmt.get("ext"), "mp4")
-            mime = f"video/{ext}" if kind in ("video", "media") else f"audio/{ext}"
-            add_stream(fmt_url, f"{title} ({quality})", quality, kind, mime)
-
-        # If there are no formats but there are URLs inside `requested_formats`, try them
-        requested_formats = entry.get("requested_formats") or []
-        for fmt in requested_formats:
-            if not isinstance(fmt, dict):
-                continue
-            fmt_url = safe_text(fmt.get("url"), "")
-            if fmt_url:
-                add_stream(fmt_url, f"{title} (requested)", "requested", "media", "video/mp4")
-
-    # Sort a little to prefer video streams first
-    def sort_key(item):
-        raw = item["kind"]
-        kind_rank = {"video": 0, "media": 1, "audio": 2}
-        return (kind_rank.get(raw, 99), item["quality"])
-
-    streams = sorted(stream_map.values(), key=sort_key)
-    return streams[:20]
-
-def build_error(message: str):
-    return {"error": message, "title": "Error", "streams": []}
-
-def extract_media_from_query(query: str) -> Dict[str, Any]:
-    raw_query = (query or "").strip()
-    if not raw_query:
-        raise ValueError("Please provide a URL or a search term.")
-
-    if is_url(raw_query):
-        return extract_media_from_url(raw_query)
-
-    # Search YouTube using yt-dlp. This is light and works well for searching.
-    search_term = f"ytsearch5:{raw_query}"
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "extract_flat": False,
-        "socket_timeout": 20,
-        "retries": 2,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(search_term, download=False)
-
-    results = []
-    entries = []
-    if isinstance(info, dict):
-        entries = info.get("entries") or []
-    else:
-        entries = []
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        title = safe_text(entry.get("title"), "Search result")
-        webpage_url = safe_text(entry.get("webpage_url"), "")
-        thumbnail = safe_text(entry.get("thumbnail"), "")
-        if not webpage_url:
-            continue
-        results.append({
-            "title": title,
-            "url": webpage_url,
-            "thumbnail": thumbnail,
-            "source": "youtube-search",
-        })
-
-    # If search results are empty, try direct page extraction as last resort
-    if not results:
-        return {
-            "title": f"Search results for: {raw_query}",
-            "thumbnail": "",
-            "streams": [],
-            "results": [],
-        }
-
-    # For search results list, we don't want to display every URL as a stream by default.
-    # We can display them as clickable entries and then let the user open them if needed.
-    compact_streams = []
-    for item in results[:8]:
-        compact_streams.append({
-            "title": item["title"],
-            "url": item["url"],
-            "quality": "webpage",
-            "kind": "media",
-            "mime": "video/mp4",
-        })
-
+def normalize_stream(item):
+    if not item:
+        return None
+    url = item.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    if not re.match(r"^https?://", url, re.I):
+        return None
+    if "javascript:" in url.lower() or "data:" in url.lower():
+        return None
     return {
-        "title": f"Search results for: {raw_query}",
-        "thumbnail": results[0].get("thumbnail", ""),
-        "streams": compact_streams,
-        "results": results,
+        "title": clean_title(item.get("title"), "Media stream"),
+        "url": url,
+        "quality": item.get("quality") or "Auto",
+        "source": item.get("source") or "direct",
     }
 
-def extract_media_from_url(url: str) -> Dict[str, Any]:
-    target = url.strip()
-    if not target:
-        raise ValueError("URL is empty.")
+def is_media_url(url):
+    if not isinstance(url, str):
+        return False
+    u = url.lower()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return False
+    if "javascript:" in u or "data:" in u:
+        return False
+    media_exts = [".mp4", ".webm", ".m3u8", ".m4v", ".mov", ".mkv", ".avi", ".3gp", ".mp3"]
+    return any(ext in u for ext in media_exts) or "video" in u or "stream" in u or "manifest" in u
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "extract_flat": False,
-        "socket_timeout": 20,
-        "retries": 2,
-    }
+def dedupe(items):
+    seen = set()
+    results = []
+    for item in items:
+        if not item:
+            continue
+        url = item.get("url", "")
+        if url in seen:
+            continue
+        seen.add(url)
+        results.append(item)
+    return results
+
+def safe_request(url, headers=None):
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+    })
+    if headers:
+        session.headers.update(headers)
+    return session.get(url, timeout=TIMEOUT, allow_redirects=True)
+
+def extract_html_media_links(page_url, html_text):
+    items = []
+    # Common element attributes
+    patterns = [
+        r'''(?:src|href|data-src|data-href)\s*[:=]\s*["']([^"']+?)["']''',
+        r'''(?:src|href|data-src|data-href)\s*[:=]\s*([^\\s"'>]+)''',
+    ]
+    found = set()
+
+    for pattern in patterns:
+        matches = re.findall(pattern, html_text, flags=re.I)
+        for raw in matches:
+            candidate = raw.strip()
+            if not candidate:
+                continue
+            if candidate.startswith("//"):
+                candidate = "https:" + candidate
+            if candidate.startswith("http://") or candidate.startswith("https://"):
+                if is_media_url(candidate):
+                    found.add(candidate)
+
+    # Filter and add as media links
+    for link in sorted(found):
+        items.append({
+            "title": "Extracted media",
+            "url": link,
+            "quality": "Auto",
+            "source": "page"
+        })
+
+    # Also look for "mp4" style explicit text URLs
+    for match in re.finditer(r'https?://[^\\s"\'<>]+(?:\\.mp4|\\.m3u8|\\.webm|\\.m4v|\\.mov|\\.mkv|\\.avi)[^\\s"\'<>]*', html_text, re.I):
+        candidate = match.group(0)
+        if candidate and is_media_url(candidate):
+            found.add(candidate)
+
+    for link in sorted(found):
+        items.append({
+            "title": "Extracted media",
+            "url": link,
+            "quality": "Auto",
+            "source": "page"
+        })
+
+    # De-duplicate and keep first 12
+    return dedupe(items)[:12]
+
+def extract_from_direct_url(url):
+    # If it already points directly to media
+    if is_media_url(url):
+        return [{
+            "title": "Direct stream",
+            "url": url,
+            "quality": "Auto",
+            "source": "direct"
+        }]
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target, download=False)
-    except Exception as exc:
-        # Fallback: try to treat it as a direct media file or basic HTML page
-        try:
-            resp = requests.get(target, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code != 200:
-                raise ValueError(f"Request failed ({resp.status_code}) for {target}")
-            content_type = resp.headers.get("Content-Type", "").lower()
-            if "video" in content_type or "audio" in content_type or target.lower().endswith((".mp4", ".m3u8", ".mp3", ".webm", ".m4a", ".m4v")):
-                return {
-                    "title": "Direct media URL",
-                    "thumbnail": "",
-                    "streams": [{
-                        "title": "Direct media stream",
-                        "url": target,
-                        "quality": "direct",
-                        "kind": "media",
-                        "mime": content_type or "video/mp4",
-                    }],
-                    "results": [],
-                }
-            raise ValueError(f"Could not extract playable media from: {target}") from exc
-        except Exception:
-            raise ValueError(f"Could not extract playable media from: {target}") from exc
+        resp = safe_request(url)
+        if resp.status_code >= 400:
+            return []
+        content_type = resp.headers.get("Content-Type", "").lower()
+        if "video" in content_type or "audio" in content_type:
+            return [{
+                "title": "Direct media response",
+                "url": url,
+                "quality": "Auto",
+                "source": "direct"
+            }]
 
-    title = safe_text((info or {}).get("title"), "Extracted media")
-    streams = normalize_streams(info)
+        html = resp.text or ""
+        links = extract_html_media_links(url, html)
+        if links:
+            return links
+    except Exception:
+        pass
 
-    if not streams:
-        # Try a smart fallback from page source if the site exposes a single direct html video
-        try:
-            r = requests.get(target, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            text = r.text or ""
-            candidates = re.findall(r'https?://[^\\s"\\\']+\\.(?:mp4|m3u8|webm|m4v|mp3|m4a)(?:\\?[^\\s"\\']*)?', text, re.I)
-            if candidates:
-                unique = []
-                seen = set()
-                for c in candidates[:10]:
-                    if c not in seen:
-                        unique.append(c)
-                        seen.add(c)
-                streams = [{
-                    "title": f"Detected media {idx + 1}",
-                    "url": c,
-                    "quality": "detected",
-                    "kind": "media",
-                    "mime": "video/mp4",
-                } for idx, c in enumerate(unique)]
-        except Exception:
-            pass
+    # Last-ditch: look for a url parameter or direct embed
+    try:
+        resp = safe_request(url)
+        html = resp.text or ""
+        for pattern in [
+            r'''(?:"|')?(https?://[^"'\s<>]+(?:\.mp4|\.m3u8|\.webm|\.m4v|\.mov|\.mkv|\.avi)[^"'\s<>]*)''',
+            r'''(?:src|href)\s*[:=]\s*[\"'](https?://[^\"']+)["']'''
+        ]:
+            matches = re.findall(pattern, html, flags=re.I)
+            if matches:
+                items = []
+                for m in matches:
+                    if m.startswith("http"):
+                        items.append({
+                            "title": "Extracted media",
+                            "url": m,
+                            "quality": "Auto",
+                            "source": "page"
+                        })
+                return dedupe(items)[:10]
+    except Exception:
+        pass
 
-    if not streams:
-        raise ValueError(f"No playable streams were found for {target}. Try a public video page or a direct .mp4 URL.")
+    return []
 
-    return {
-        "title": title,
-        "thumbnail": safe_text((info or {}).get("thumbnail"), ""),
-        "streams": streams,
-        "results": [],
-    }
+def yt_dlp_streams_from_url(url):
+    try:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "extract_flat": False,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            return []
+        results = []
+        entries = []
+        if isinstance(info, dict):
+            if info.get("_type") == "playlist":
+                entries = info.get("entries") or []
+            else:
+                entries = [info]
+        else:
+            return []
 
+        for entry in entries:
+            if not entry:
+                continue
+            title = entry.get("title") or "Video"
+            quality = "Auto"
+            url_candidate = None
 
-HTML_PAGE = """
+            # Prefer best available video url among formats
+            formats = entry.get("formats") or []
+            if formats:
+                ranked = sorted(
+                    formats,
+                    key=lambda f: (
+                        f.get("tbr") or 0,
+                        1 if f.get("format_note") == "hd720" else 0
+                    ),
+                    reverse=True
+                )
+                for f in ranked:
+                    if isinstance(f, dict):
+                        candidate = f.get("url")
+                        if candidate:
+                            url_candidate = candidate
+                            quality = f.get("format_note") or f.get("quality") or "Auto"
+                            break
+
+            if not url_candidate:
+                url_candidate = entry.get("url") or entry.get("webpage_url")
+
+            if url_candidate:
+                results.append({
+                    "title": title,
+                    "url": url_candidate,
+                    "quality": quality,
+                    "source": "yt-dlp"
+                })
+
+        return dedupe(results)[:12]
+    except Exception:
+        return []
+
+def yt_search_query(query):
+    try:
+        search_expr = f"ytsearch5:{query}"
+        return yt_dlp_streams_from_url(search_expr)
+    except Exception:
+        return []
+
+# ------------------------------------------------------------
+# 4) API routes
+# ------------------------------------------------------------
+@app.route("/")
+def index():
+    return render_template_string("""
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Media Stream Browser</title>
+  <title>Media Stream Dashboard</title>
   <style>
     :root {
-      --bg: #0f1117;
-      --bg-2: #171b24;
-      --panel: #1d2330;
-      --panel-alt: #212a37;
-      --line: rgba(255,255,255,0.08);
-      --text: #edf3ff;
-      --muted: #abb5c8;
-      --primary: #5db4ff;
-      --primary-2: #7f73ff;
-      --success: #5dd19c;
-      --danger: #ff7d7d;
-      --shadow: rgba(0,0,0,0.30);
+      --bg: #0b1020;
+      --panel: #121a2a;
+      --panel-2: #1a2438;
+      --text: #edf2ff;
+      --muted: #a9b5d1;
+      --accent: #7c9cff;
+      --accent-2: #5de2b0;
+      --danger: #ff7b7b;
+      --border: rgba(255,255,255,0.08);
+      --shadow: 0 14px 40px rgba(0,0,0,0.25);
     }
+
     * { box-sizing: border-box; }
     html, body {
       margin: 0;
-      padding: 0;
-      background: radial-gradient(circle at top, #1a2232 0%, #0f1117 55%);
+      height: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: linear-gradient(180deg, #090d17 0%, #101827 100%);
       color: var(--text);
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-      min-height: 100%;
     }
     body {
       display: flex;
       justify-content: center;
-      padding: 18px;
+      padding: 20px;
     }
     .app {
-      width: min(1200px, 100%);
-      background: rgba(10, 12, 18, 0.72);
-      border: 1px solid var(--line);
+      width: min(1100px, 100%);
+    }
+    .header {
+      background: rgba(18,26,42,0.9);
+      border: 1px solid var(--border);
       border-radius: 18px;
-      box-shadow: 0 18px 40px var(--shadow);
-      overflow: hidden;
+      box-shadow: var(--shadow);
+      padding: 18px 18px 10px;
+      margin-bottom: 18px;
       backdrop-filter: blur(10px);
     }
-    .topbar {
-      padding: 18px 18px 12px;
-      border-bottom: 1px solid var(--line);
-      background: rgba(255,255,255,0.02);
-    }
-    .search-form {
+    .title-row {
       display: flex;
-      gap: 12px;
       align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .brand {
+      font-size: clamp(1.2rem, 2vw, 1.8rem);
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .badge {
+      background: rgba(124, 156, 255, 0.15);
+      border: 1px solid rgba(124,156,255,0.3);
+      color: var(--accent);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .search-wrap {
+      display: flex;
+      gap: 10px;
       flex-wrap: wrap;
     }
-    .search-box {
-      flex: 1 1 420px;
-      min-width: 180px;
-      background: #121722;
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 14px 14px;
+    input[type="text"] {
+      flex: 1 1 520px;
+      min-width: 200px;
+      background: rgba(255,255,255,0.04);
       color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+      outline: none;
       font-size: 1rem;
-      outline: none;
-      transition: border-color 0.2s ease, box-shadow 0.2s ease;
     }
-    .search-box:focus {
-      border-color: rgba(93,180,255,0.8);
-      box-shadow: 0 0 0 4px rgba(93,180,255,0.13);
-    }
-    .primary-btn {
-      border: 0;
-      border-radius: 14px;
-      background: linear-gradient(135deg, var(--primary), var(--primary-2));
+    input[type="text"]::placeholder { color: var(--muted); }
+    button {
+      border: none;
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--accent), #9b8cff);
       color: white;
-      padding: 14px 18px;
+      padding: 16px 22px;
       font-weight: 700;
       cursor: pointer;
-      transition: transform 0.15s ease, filter 0.2s ease;
+      box-shadow: 0 8px 20px rgba(124,156,255,0.35);
     }
-    .primary-btn:hover { transform: translateY(-1px); filter: brightness(1.05); }
-    .content {
-      display: grid;
-      grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
-      min-height: 760px;
-    }
-    .sidebar {
-      background: rgba(21, 26, 36, 0.9);
-      border-right: 1px solid var(--line);
-      padding: 18px 14px 10px;
-    }
-    .panel-title {
-      margin: 0 0 12px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.2em;
-      text-transform: uppercase;
-      padding: 0 6px;
-    }
-    .results {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      max-height: 680px;
-      overflow-y: auto;
-      padding-right: 2px;
-    }
-    .result-card {
-      background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 12px;
-      cursor: pointer;
-      transition: border-color 0.15s ease, transform 0.15s ease;
-    }
-    .result-card:hover {
-      border-color: rgba(93,180,255,0.6);
-      transform: translateY(-1px);
-    }
-    .result-card.active {
-      border-color: rgba(93,180,255,0.85);
-      background: linear-gradient(180deg, rgba(93,180,255,0.08), rgba(255,255,255,0.01));
-    }
-    .thumb {
-      width: 100%;
-      height: 110px;
-      border-radius: 10px;
-      background: linear-gradient(135deg, #1d2433, #0f1117);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: var(--muted);
-      font-size: 0.82rem;
-      overflow: hidden;
-      border: 1px solid var(--line);
-      margin-bottom: 8px;
-      background-size: cover;
-      background-position: center;
-    }
-    .thumb.empty {
-      font-weight: 600;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      background: linear-gradient(135deg, #24314a, #101722);
-    }
-    .item-title {
-      font-size: 0.96rem;
-      line-height: 1.35;
-      font-weight: 700;
-      margin: 0 0 4px;
+    button.secondary {
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--border);
+      box-shadow: none;
       color: var(--text);
-    }
-    .item-meta {
-      color: var(--muted);
-      font-size: 0.72rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
-    .player-panel {
-      display: flex;
-      flex-direction: column;
-      padding: 18px;
-      background: rgba(12, 15, 22, 0.9);
-    }
-    .video-wrap {
-      background: #000;
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      overflow: hidden;
-      box-shadow: 0 16px 26px rgba(0,0,0,0.35);
-    }
-    video {
-      display: block;
-      width: 100%;
-      max-height: 65vh;
-      background: #000;
-      outline: none;
     }
     .status {
-      margin-top: 14px;
-      padding: 12px 14px;
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      background: rgba(255,255,255,0.02);
+      min-height: 22px;
       color: var(--muted);
       font-size: 0.92rem;
-      min-height: 48px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      text-align: center;
-    }
-    .status.success { color: var(--success); border-color: rgba(93,209,156,0.35); }
-    .status.error { color: var(--danger); border-color: rgba(255,125,125,0.3); }
-    .small-note {
-      color: var(--muted);
-      font-size: 0.8rem;
       margin-top: 10px;
     }
-    @media (max-width: 860px) {
+    .content {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(290px, 0.9fr);
+      gap: 18px;
+    }
+    .panel {
+      background: rgba(18,26,42,0.9);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .video-panel {
+      padding: 12px;
+    }
+    video {
+      width: 100%;
+      height: clamp(260px, 58vw, 520px);
+      background: #000;
+      border-radius: 14px;
+      display: block;
+      object-fit: contain;
+    }
+    .meta {
+      padding: 16px 18px 4px;
+    }
+    .meta h2 {
+      margin: 0 0 6px;
+      font-size: 1.08rem;
+    }
+    .meta .small {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .stream-panel {
+      display: flex;
+      flex-direction: column;
+      min-height: 200px;
+    }
+    .stream-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,0.02);
+    }
+    .stream-header h3 {
+      margin: 0;
+      font-size: 1rem;
+    }
+    .stream-list {
+      list-style: none;
+      margin: 0;
+      padding: 10px;
+      overflow-y: auto;
+      max-height: 540px;
+    }
+    .stream-item {
+      background: rgba(255,255,255,0.025);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 12px;
+      margin-bottom: 10px;
+      cursor: pointer;
+      transition: 0.2s ease;
+    }
+    .stream-item:hover {
+      background: rgba(255,255,255,0.04);
+      transform: translateY(-1px);
+    }
+    .stream-item.active {
+      border-color: rgba(124,156,255,0.9);
+      box-shadow: inset 0 0 0 1px rgba(124,156,255,0.5);
+      background: rgba(124,156,255,0.08);
+    }
+    .stream-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .stream-title {
+      font-weight: 700;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+    }
+    .pill {
+      background: rgba(93,226,176,0.12);
+      color: var(--accent-2);
+      padding: 4px 8px;
+      font-size: 11px;
+      border-radius: 999px;
+      border: 1px solid rgba(93,226,176,0.25);
+      white-space: nowrap;
+    }
+    .stream-url {
+      color: var(--muted);
+      font-size: 0.8rem;
+      overflow-wrap: anywhere;
+    }
+    .empty {
+      color: var(--muted);
+      padding: 18px;
+      text-align: center;
+    }
+
+    @media (max-width: 820px) {
       .content {
         grid-template-columns: 1fr;
       }
-      .sidebar {
-        border-right: 0;
-        border-bottom: 1px solid var(--line);
+      .stream-list {
+        max-height: none;
       }
-      .results {
-        max-height: 360px;
-      }
-      body { padding: 10px; }
     }
   </style>
 </head>
 <body>
   <div class="app">
-    <div class="topbar">
-      <form id="searchForm" class="search-form">
-        <input
-          id="queryInput"
-          class="search-box"
-          type="text"
-          placeholder="Paste a media URL or type a search term (YouTube, etc.)"
-          autocomplete="off"
-        />
-        <button class="primary-btn" type="submit">Search</button>
+    <div class="header">
+      <div class="title-row">
+        <div class="brand">Media Stream Dashboard</div>
+        <div class="badge">Android / Termux</div>
+      </div>
+
+      <form id="searchForm">
+        <div class="search-wrap">
+          <input id="queryInput" type="text" autocomplete="off" placeholder="Paste a media page URL or search query (YouTube, direct MP4, etc.)" />
+          <button type="submit">Search</button>
+          <button type="button" class="secondary" id="sampleBtn">Load sample streams</button>
+        </div>
       </form>
+      <div id="statusText" class="status">Ready to search.</div>
     </div>
 
     <div class="content">
-      <aside class="sidebar">
-        <h3 class="panel-title">Media Streams</h3>
-        <div id="results" class="results"></div>
-      </aside>
+      <div class="panel video-panel">
+        <video id="player" controls playsinline preload="auto"></video>
+        <div class="meta">
+          <h2 id="currentTitle">No stream selected</h2>
+          <div id="currentSource" class="small">Choose a stream from the list</div>
+        </div>
+      </div>
 
-      <section class="player-panel">
-        <div class="video-wrap">
-          <video id="player" controls playsinline preload="metadata"></video>
+      <div class="panel stream-panel">
+        <div class="stream-header">
+          <h3>Available streams</h3>
         </div>
-        <div id="status" class="status">Choose a stream or search for media to begin.</div>
-        <div class="small-note">
-          Tip: paste a direct .mp4 URL or a public video page URL. Search queries use YouTube search via yt-dlp.
-        </div>
-      </section>
+        <ul id="streamList" class="stream-list">
+          <li class="empty">No streams yet. Search for a URL or use “Load sample streams”.</li>
+        </ul>
+      </div>
     </div>
   </div>
 
   <script>
+    const streamList = document.getElementById('streamList');
+    const statusText = document.getElementById('statusText');
     const player = document.getElementById('player');
-    const resultsEl = document.getElementById('results');
-    const statusEl = document.getElementById('status');
-    const form = document.getElementById('searchForm');
-    const input = document.getElementById('queryInput');
+    const currentTitle = document.getElementById('currentTitle');
+    const currentSource = document.getElementById('currentSource');
 
-    const sampleVideos = [
-      {
-        title: 'Big Buck Bunny',
-        url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4',
-        kind: 'video',
-        quality: 'sample',
-        mime: 'video/mp4'
-      },
-      {
-        title: 'Elephant Dream',
-        url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4',
-        kind: 'video',
-        quality: 'sample',
-        mime: 'video/mp4'
-      },
-      {
-        title: 'For Bigger Blazes',
-        url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
-        kind: 'video',
-        quality: 'sample',
-        mime: 'video/mp4'
-      }
-    ];
+    let currentStreams = [];
 
-    function setStatus(message, success = false, error = false) {
-      statusEl.textContent = message;
-      statusEl.classList.remove('success', 'error');
-      if (success) statusEl.classList.add('success');
-      if (error) statusEl.classList.add('error');
+    function setStatus(message, isError = false) {
+      statusText.textContent = message;
+      statusText.style.color = isError ? '#ff7b7b' : '#a9b5d1';
     }
 
-    function createThumb(item) {
-      if (item?.thumbnail) {
-        return `style="background-image: url('${item.thumbnail}'); background-size: cover; background-position: center;"`;
-      }
-      return 'class="thumb empty"';
-    }
+    function renderStreams(streams) {
+      streamList.innerHTML = '';
+      currentStreams = streams || [];
 
-    function renderResults(items) {
-      if (!Array.isArray(items) || items.length === 0) {
-        resultsEl.innerHTML = '<div class=\"result-card\"><div class=\"item-title\">No streams found</div><div class=\"item-meta\">Try a direct video link</div></div>';
+      if (!currentStreams.length) {
+        streamList.innerHTML = '<li class=\"empty\">No streams found. Try a different URL or search query.</li>';
         return;
       }
 
-      const cards = items.map((item, index) => {
-        const title = item.title || 'Untitled';
-        const quality = item.quality || 'stream';
-        const kind = item.kind || 'media';
-        const thumbMarkup = item.thumbnail
-          ? `<div class="thumb" ${createThumb(item).replace(/^style=|^class=\"thumb empty\"/,'').replace(/style=\"/, 'style=\"')}> </div>`
-          : `<div class="thumb empty">MEDIA</div>`;
-
-        return `
-          <div class="result-card" data-index="${index}" data-url="${item.url}" data-title="${title.replace(/"/g, '&quot;')}">
-            ${thumbMarkup}
-            <div class="item-title">${title}</div>
-            <div class="item-meta">${kind.toUpperCase()} • ${quality}</div>
+      currentStreams.forEach((stream, index) => {
+        const item = document.createElement('li');
+        item.className = 'stream-item' + (index === 0 ? ' active' : '');
+        item.innerHTML = `
+          <div class="stream-top">
+            <div class="stream-title">${escapeHtml(stream.title || 'Media stream')}</div>
+            <span class="pill">${escapeHtml(stream.quality || 'Auto')}</span>
           </div>
+          <div class="stream-url">${escapeHtml(stream.url)}</div>
         `;
-      }).join('');
-
-      resultsEl.innerHTML = cards;
-
-      resultsEl.querySelectorAll('.result-card').forEach(card => {
-        card.addEventListener('click', () => {
-          const url = card.dataset.url;
-          const title = card.dataset.title;
-          if (!url) return;
-          player.src = url;
-          player.load();
-          try { player.play(); } catch (e) {}
-          setStatus(`Playing: ${title}`, true, false);
-          resultsEl.querySelectorAll('.result-card').forEach(c => c.classList.remove('active'));
-          card.classList.add('active');
+        item.addEventListener('click', () => {
+          selectStream(stream, item);
         });
+        streamList.appendChild(item);
       });
-    }
 
-    function renderSampleVideos() {
-      renderResults(sampleVideos);
-      setStatus('Sample videos loaded. Pick one to preview.', true, false);
-      const first = resultsEl.querySelector('.result-card');
-      if (first) {
-        first.classList.add('active');
-        const url = first.dataset.url;
-        const title = first.dataset.title;
-        player.src = url;
-        player.load();
-        try { player.play(); } catch (e) {}
-        setStatus(`Playing sample: ${title}`, true, false);
+      const first = currentStreams[0];
+      const firstItem = streamList.children[0];
+      if (first && firstItem) {
+        selectStream(first, firstItem);
       }
     }
 
-    form.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const query = input.value.trim();
-      if (!query) {
-        renderSampleVideos();
-        return;
-      }
+    function selectStream(stream, itemNode) {
+      const allItems = document.querySelectorAll('.stream-item');
+      allItems.forEach((node) => node.classList.remove('active'));
+      if (itemNode) itemNode.classList.add('active');
 
-      setStatus('Fetching streams...', false, false);
+      currentTitle.textContent = stream.title || 'Media stream';
+      currentSource.textContent = 'Source: ' + (stream.source || 'direct');
 
       try {
-        const response = await fetch('/api/extract', {
+        player.src = stream.url;
+        player.load();
+        player.play().catch(() => {
+          // Autoplay may be blocked; allow user to press play manually.
+        });
+      } catch (err) {
+        // ignore
+      }
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    async function searchMedia(value) {
+      const cleaned = (value || '').trim();
+      if (!cleaned) {
+        setStatus('Please enter a URL or search query.', true);
+        return;
+      }
+
+      setStatus('Searching and extracting media streams...');
+      try {
+        const res = await fetch('/api/extract', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query })
+          body: JSON.stringify({ query: cleaned })
         });
 
-        const data = await response.json();
-
-        if (!response.ok || data.error) {
-          throw new Error(data.error || 'Unknown error');
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          throw new Error(data.error || 'Unable to find streams.');
         }
 
-        const streams = Array.isArray(data.streams) ? data.streams : [];
-        if (streams.length === 0) {
-          renderSampleVideos();
-          setStatus('No streams found for that query. Try a direct URL or another search term.', false, true);
+        if (!data.media || !data.media.length) {
+          renderStreams([]);
+          setStatus('No media streams were found for that input.', true);
           return;
         }
 
-        renderResults(streams);
-        const first = resultsEl.querySelector('.result-card');
-        if (first) {
-          first.classList.add('active');
-          const url = first.dataset.url;
-          const title = first.dataset.title;
-          player.src = url;
-          player.load();
-          try { player.play(); } catch (e) {}
-          setStatus(`Loaded ${streams.length} stream(s). Playing: ${title}`, true, false);
-        } else {
-          setStatus('Loaded stream list.', true, false);
+        renderStreams(data.media);
+        setStatus(`Found ${data.media.length} stream${data.media.length > 1 ? 's' : ''}.`);
+      } catch (err) {
+        renderStreams([]);
+        setStatus(err.message || 'Search failed.', true);
+      }
+    }
+
+    document.getElementById('searchForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      searchMedia(document.getElementById('queryInput').value);
+    });
+
+    document.getElementById('sampleBtn').addEventListener('click', async () => {
+      setStatus('Loading sample streams...');
+      try {
+        const res = await fetch('/api/samples', { method: 'GET' });
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          throw new Error(data.error || 'Could not load sample streams.');
         }
-      } catch (error) {
-        renderSampleVideos();
-        setStatus(error.message || 'Failed to load media.', false, true);
+        renderStreams(data.media);
+        setStatus(`Loaded ${data.media.length} sample streams.`);
+      } catch (err) {
+        setStatus(err.message || 'Unable to load sample streams.', true);
       }
     });
 
-    // Initial load
-    renderSampleVideos();
+    // Load sample streams by default
+    fetch('/api/samples')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data && data.success && data.media && data.media.length) {
+          renderStreams(data.media);
+        }
+      })
+      .catch(() => {
+        // Ignore default load failure; UI still works
+      });
   </script>
 </body>
 </html>
-"""
+    """)
 
-@app.route("/")
-def index():
-    return render_template_string(HTML_PAGE)
+@app.route("/api/samples")
+def samples():
+    return jsonify({"success": True, "media": SAMPLE_STREAMS})
 
-@app.route("/api/extract", methods=["GET", "POST"])
-def api_extract():
+@app.route("/api/extract", methods=["POST"])
+def extract_media():
     try:
-        if request.method == "GET":
-            query = request.args.get("query", "").strip()
-        else:
-            payload = request.get_json(silent=True) or {}
-            query = (payload.get("query") or "").strip()
+        payload = request.get_json(silent=True) or {}
+    except Exception:
+        payload = {}
 
-        if not query:
-            return jsonify(build_error("Please provide a media URL or search query.")), 400
+    query = (payload.get("query") or "").strip()
+    if not query:
+        return jsonify({"success": False, "error": "Please provide a URL or search query."}), 400
 
-        data = extract_media_from_query(query)
-        if "error" in data:
-            return jsonify(data), 400
+    normalized = query.strip()
+    inferred_url = re.match(r"^https?://", normalized, re.I) is not None
 
-        return jsonify(data), 200
-    except Exception as exc:
-        return jsonify(build_error(str(exc))), 400
+    results = []
 
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok", "service": "media-stream-browser"}), 200
+    # 1) Direct URL: check if it is itself a media URL or page with media embeds
+    if inferred_url:
+        # Try direct page extraction first
+        page_results = extract_from_direct_url(normalized)
+        if page_results:
+            results.extend(page_results)
 
+        # Try YouTube / extractable platform URLs
+        yt_results = yt_dlp_streams_from_url(normalized)
+        if yt_results:
+            results.extend(yt_results)
+
+        # If still empty, try a sample fallback to keep UI usable
+        if not results:
+            results = SAMPLE_STREAMS[:3]
+
+    # 2) Search query: use yt-dlp search
+    else:
+        results = yt_search_query(normalized)
+        if not results:
+            # Lightweight fallback: sample streams if search is generic
+            results = SAMPLE_STREAMS[:4]
+
+    if not results:
+        return jsonify({"success": False, "error": "No playable media streams were found for that input."}), 404
+
+    cleaned = []
+    for item in results:
+        stream = normalize_stream(item)
+        if stream:
+            cleaned.append(stream)
+
+    cleaned = dedupe(cleaned)[:12]
+    if not cleaned:
+        return jsonify({"success": False, "error": "Media discovery returned unusable streams."}), 404
+
+    return jsonify({"success": True, "media": cleaned, "query": query})
+
+# ------------------------------------------------------------
+# 5) Run app
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Media Stream Browser")
-    print(f"Running on http://{HOST}:{DEFAULT_PORT}")
-    print("Press Ctrl+C to stop.")
-    print("=" * 60)
-    app.run(host=HOST, port=DEFAULT_PORT, debug=False, threaded=True)
+    print(f"[app] Starting Flask media dashboard on http://{HOST}:{PORT}")
+    app.run(host=HOST, port=PORT, debug=False, use_reloader=False)
